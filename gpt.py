@@ -260,12 +260,12 @@ class FundamentalMusicEmbeddingSlots(nn.Module):
             self.chunk_scale = nn.Parameter(torch.ones(n_slots, 1))
 
     def forward(self, inp: torch.Tensor) -> torch.Tensor:
-        # inp: (N,) or (N, T) etc.
+        # inp: (N,), (N, T), etc.
         # 計算はバッファ(angle_rates)の型に合わせて行い、最終出力はパラメータ(bias)の型に合わせる
         
         # 数値計算のために型を合わせる (half/bfloat16対応)
-        x = inp.to(dtype=self.angle_rates.dtype)
-        angle_rads = x.unsqueeze(-1) * self.angle_rates  # (..., d_model)
+        x = inp.to(dtype=self.angle_rates.dtype).reshape(-1)
+        angle_rads = x.unsqueeze(-1) * self.angle_rates  # (N, d_model)
 
         # sin/cos計算
         # sin/cosは入力と同じ型で計算される
@@ -284,8 +284,8 @@ class FundamentalMusicEmbeddingSlots(nn.Module):
         if self.use_scale:
             out = out * self.chunk_scale.unsqueeze(0)
 
-        # (N, n_slots * d_model) に整形
-        return out.reshape(inp.shape[0], self.n_slots * self.d_model)
+        # (inp.shape..., n_slots * d_model) に整形
+        return out.reshape(*inp.shape, self.n_slots * self.d_model)
 
 class MusicVTE_FMEFast(nn.Module):
     def __init__(
@@ -403,9 +403,15 @@ class GPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wte = FundamentalMusicEmbeddingSlots(
+                d_model=config.n_embd,
+                n_slots=1,
+            ),
             # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual learning
-            vte = nn.Embedding(config.vocab_size, config.n_embd*12),
+            vte = FundamentalMusicEmbeddingSlots(
+                d_model=config.n_embd,
+                n_slots=12,
+            ),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size)
@@ -609,7 +615,13 @@ model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
 
 # init the optimizer(s)
-optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight, raw_model.transformer.vte.weight], lr=0.6, betas=(0.8, 0.95), fused=True)
+optimizer1 = torch.optim.Adam(
+    list(raw_model.transformer.wte.parameters())
+    + list(raw_model.transformer.vte.parameters()),
+    lr=0.6,
+    betas=(0.8, 0.95),
+    fused=True,
+)
 optimizer2 = torch.optim.Adam([raw_model.lm_head.weight], lr=0.008, betas=(0.8, 0.95), fused=True)
 params = list(raw_model.transformer.h.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
