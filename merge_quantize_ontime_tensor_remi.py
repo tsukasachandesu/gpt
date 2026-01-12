@@ -1,4 +1,4 @@
-﻿import argparse
+import argparse
 import inspect
 import json
 import os
@@ -23,6 +23,10 @@ ABS_END_ID = 513
 EOF_ID = 514
 PAD_ID = 515
 TOKEN_DTYPE = np.uint16
+HEADER_INTS = 256
+HEADER_BYTES = HEADER_INTS * 4
+HEADER_MAGIC = 20240520
+HEADER_VERSION = 1
 
 
 def load_score(path: Path) -> Score:
@@ -166,6 +170,7 @@ class DatasetWriter:
         self.flush_interval = max(0, int(flush_interval))
         self.fsync = bool(fsync)
         self.write_count = 0
+        self.token_count = 0
         self._open_shard(resume=resume)
 
     def _shard_paths(self) -> tuple[Path, Path]:
@@ -174,28 +179,58 @@ class DatasetWriter:
 
     def _open_shard(self, resume: bool = False) -> None:
         if self.bin_fp:
+            self._write_header(self.token_count)
             self.bin_fp.close()
         if self.idx_fp:
             self.idx_fp.close()
         bin_path, idx_path = self._shard_paths()
         if resume and bin_path.exists():
-            self.bin_fp = bin_path.open("ab")
-            self.offset = bin_path.stat().st_size
+            self.bin_fp = bin_path.open("r+b")
+            file_size = bin_path.stat().st_size
+            if file_size < HEADER_BYTES:
+                raise ValueError("invalid shard: missing header")
+            header = np.frombuffer(self.bin_fp.read(HEADER_BYTES), dtype=np.int32)
+            if header[0] != HEADER_MAGIC or header[1] != HEADER_VERSION:
+                raise ValueError("invalid shard header")
+            data_bytes = file_size - HEADER_BYTES
+            if data_bytes % np.dtype(TOKEN_DTYPE).itemsize != 0:
+                raise ValueError("invalid shard: token bytes not aligned")
+            self.token_count = int(data_bytes // np.dtype(TOKEN_DTYPE).itemsize)
+            self._write_header(self.token_count)
+            self.bin_fp.seek(0, os.SEEK_END)
+            self.offset = file_size
             self.idx_fp = idx_path.open("a", encoding="utf-8")
         else:
-            self.bin_fp = bin_path.open("wb")
+            self.bin_fp = bin_path.open("w+b")
+            self.token_count = 0
+            self.bin_fp.write(self._make_header(self.token_count))
             self.idx_fp = idx_path.open("w", encoding="utf-8")
-            self.offset = 0
+            self.offset = HEADER_BYTES
 
     def _rotate_if_needed(self, nbytes: int) -> None:
         if self.shard_size_bytes <= 0:
             return
-        if self.offset == 0:
+        if self.offset <= HEADER_BYTES:
             return
         if self.offset + nbytes <= self.shard_size_bytes:
             return
         self.shard_index += 1
         self._open_shard(resume=False)
+
+    def _make_header(self, ntok: int) -> bytes:
+        header = np.zeros(HEADER_INTS, dtype=np.int32)
+        header[0] = HEADER_MAGIC
+        header[1] = HEADER_VERSION
+        header[2] = int(ntok)
+        return header.tobytes()
+
+    def _write_header(self, ntok: int) -> None:
+        if self.bin_fp is None:
+            return
+        current_pos = self.bin_fp.tell()
+        self.bin_fp.seek(0)
+        self.bin_fp.write(self._make_header(ntok))
+        self.bin_fp.seek(current_pos)
 
     def write(self, tokens: np.ndarray, midi_path: Path) -> None:
         data = np.ascontiguousarray(tokens, dtype=TOKEN_DTYPE)
@@ -214,7 +249,9 @@ class DatasetWriter:
         self.idx_fp.write(json.dumps(record, ensure_ascii=False) + "\n")
         self.offset += nbytes
         self.write_count += 1
+        self.token_count += int(data.size)
         if self.flush_interval > 0 and (self.write_count % self.flush_interval == 0):
+            self._write_header(self.token_count)
             self.bin_fp.flush()
             self.idx_fp.flush()
             if self.fsync:
@@ -223,6 +260,7 @@ class DatasetWriter:
 
     def close(self) -> None:
         if self.bin_fp:
+            self._write_header(self.token_count)
             self.bin_fp.close()
             self.bin_fp = None
         if self.idx_fp:
