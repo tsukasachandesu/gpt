@@ -7,6 +7,7 @@ import glob
 import time
 import contextlib
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 import torch
