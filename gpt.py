@@ -225,7 +225,7 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     vocab_size : int = 164
-    n_layer : int = 12
+    n_layer : int = 18
     n_head : int = 6 # head dim 128 suggested by @Grad62304977
     n_embd : int = 768
 
@@ -365,15 +365,15 @@ class Hyperparameters:
     input_bin : str = 'train.bin' # input .bin to train on
     input_val_bin : str = 'val.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int = 8 # batch size, in sequences, across all devices
+    batch_size : int = 16 # batch size, in sequences, across all devices
     sequence_length : int = 2048 # sequence length, in tokens
-    num_iterations : int = 1530 # number of iterations to run
+    num_iterations : int = 600 # number of iterations to run
     warmup_iters : int = 0
-    cooldown_iters : int = 600 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
+    cooldown_iters : int = 100 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
-    val_loss_every : int = 300 # every how many steps to evaluate val loss? 0 for only at the end
-    val_tokens : int = 262144 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    val_loss_every : int = 10 # every how many steps to evaluate val loss? 0 for only at the end
+    val_tokens : int = 4096 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
 
