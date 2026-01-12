@@ -23,42 +23,6 @@ create_block_mask = torch.compile(create_block_mask, dynamic=False)
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
-class FundamentalMusicEmbedding(nn.Module):
-    """
-    Fundamental Music Embedding (FME):
-    - sinusoidal encoding をベースにしつつ
-    - token type ごとに学習可能な位相バイアス（phase bias）を入れる実装
-
-    入力: values (...,)  ※ pitch番号 / bar番号 / pos番号など「値」
-    出力: (..., n_embd)
-    """
-
-    def __init__(self, n_embd: int, base: float = 10000.0, learnable_phase_bias: bool = True):
-        super().__init__()
-        if n_embd % 2 != 0:
-            raise ValueError(f"n_embd must be even for sinusoidal encoding, got {n_embd}")
-        self.n_embd = n_embd
-        half = n_embd // 2
-
-        inv_freq = base ** (-torch.arange(0, half, dtype=torch.float32) / half)
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-        if learnable_phase_bias:
-            self.phase_bias = nn.Parameter(torch.zeros(half))
-        else:
-            self.register_buffer("phase_bias", torch.zeros(half), persistent=False)
-
-    def forward(self, values: torch.Tensor) -> torch.Tensor:
-        v = values.to(dtype=self.inv_freq.dtype)
-        angles = v.unsqueeze(-1) * self.inv_freq
-        angles = angles + self.phase_bias
-
-        sin = torch.sin(angles)
-        cos = torch.cos(angles)
-
-        emb = torch.stack((sin, cos), dim=-1).reshape(*values.shape, self.n_embd)
-        return emb
-
 def zeropower_via_svd(G, steps=None):
     U, S, V = G.svd()
     return U @ V.T
@@ -160,6 +124,36 @@ class Muon(torch.optim.Optimizer):
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
+
+class FundamentalMusicEmbedding(nn.Module):
+    """
+    Fundamental Music Embedding (FME):
+    - sinusoidal encoding をベースにしつつ
+    - token type ごとに学習可能な位相バイアス（phase bias）を入れる実装
+    入力: values (...,)  ※ pitch番号 / bar番号 / pos番号など「値」
+    出力: (..., n_embd)
+    """
+    def __init__(self, n_embd: int, base: float = 10000.0, learnable_phase_bias: bool = True):
+        super().__init__()
+        if n_embd % 2 != 0:
+            raise ValueError(f"n_embd must be even for sinusoidal encoding, got {n_embd}")
+        self.n_embd = n_embd
+        half = n_embd // 2
+        inv_freq = base ** (-torch.arange(0, half, dtype=torch.float32) / half)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        if learnable_phase_bias:
+            self.phase_bias = nn.Parameter(torch.zeros(half))
+        else:
+            self.register_buffer("phase_bias", torch.zeros(half), persistent=False)
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        v = values.to(dtype=self.inv_freq.dtype)
+        angles = v.unsqueeze(-1) * self.inv_freq
+        angles = angles + self.phase_bias
+        sin = torch.sin(angles)
+        cos = torch.cos(angles)
+        emb = torch.stack((sin, cos), dim=-1).reshape(*values.shape, self.n_embd)
+        return emb
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
