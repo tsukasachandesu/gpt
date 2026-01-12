@@ -203,47 +203,134 @@ class Muon(torch.optim.Optimizer):
             update_prev()
 
 # -----------------------------------------------------------------------------
-class FundamentalMusicEmbeddingOptimized(nn.Module):
-    def __init__(self, d_model, base=10000, apply_linear=True):
+class FundamentalMusicEmbedding(nn.Module):
+    """
+    Guo et al. (AAAI 2023) の Fundamental Music Embedding (FME) の実装。
+    Sinusoidal Encoding をベースにし、学習可能な translation_bias を加算する。
+    """
+    def __init__(self, d_model, base=10000):
         super().__init__()
         self.d_model = d_model
         
         # 1. 計算済みの角度係数をバッファとして登録
-        # これにより model.to(device) した際に自動的にGPUへ移動し、state_dictにも保存される
+        # (state_dictに含まれ、device移動も自動化される)
         i = torch.arange(d_model)
         exponent = (2 * (i // 2)) / d_model
         angle_rates = 1 / torch.pow(base, exponent)
         self.register_buffer('angle_rates', angle_rates.view(1, 1, -1))
-        
-        # 2. 学習可能なバイアス
+
+        # 2. 学習可能なバイアス (Broadcasting用に (1, 1, d_model))
+        # 各属性空間（Pitch空間, Bar空間...）への平行移動を担当
         self.translation_bias = nn.Parameter(torch.randn(1, 1, d_model))
-        
-        # 3. オプションで線形層 (FME_v2の機能を取り込む場合)
-        if apply_linear:
-            self.linear = nn.Linear(d_model, d_model)
-        else:
-            self.linear = None
 
     def forward(self, inp):
-        # inp shape: (batch, num_pitch)
+        """
+        Args:
+            inp: (Batch, Time) の数値データ (float or int)
+                 PitchならMIDIノート番号, Barなら小節数カウントなど
+        Returns:
+            (Batch, Time, d_model) の埋め込み
+        """
+        # (Batch, Time, 1)
+        x = inp.unsqueeze(-1).float()
         
-        # ブロードキャストを利用して角度を計算 (batch, num_pitch, d_model)
-        x = inp.unsqueeze(-1)
+        # 角度計算: value * frequency
+        # (Batch, Time, d_model)
         angle_rads = x * self.angle_rates
-        
+
         # sin/cos の適用
-        # メモリ効率のため empty_like を使用し、in-placeで代入
+        # メモリ効率のため empty_like を使用して生成
         pos_encoding = torch.empty_like(angle_rads)
         pos_encoding[..., 0::2] = torch.sin(angle_rads[..., 0::2])
         pos_encoding[..., 1::2] = torch.cos(angle_rads[..., 1::2])
-        
+
         # バイアスの加算
         out = pos_encoding + self.translation_bias
+        return out
+
+class MusicEmbedding(nn.Module):
+    """
+    REMI形式のトークン列に対し、属性ごとに異なる FME または nn.Embedding を適用して統合するクラス。
+    
+    Vocabulary Layout (Total 164):
+      - Pitch : 0   ~ 127 (128 tokens) -> FME (Value = Token ID)
+      - Bar   : 128       (1 token)    -> FME (Value = Cumulative Count)
+      - Pos   : 129 ~ 160 (32 tokens)  -> FME (Value = Token ID - 129)
+      - Other : 161 ~ 163 (3 tokens)   -> nn.Embedding (Standard)
+    """
+    def __init__(self, vocab_size, d_model, base=10000):
+        super().__init__()
+        self.d_model = d_model
         
-        # 線形層の適用 (ある場合)
-        if self.linear is not None:
-            out = self.linear(out)
+        # 定数定義
+        self.pitch_start = 0
+        self.pitch_end   = 128  # 0-127
+        self.bar_token   = 128
+        self.pos_start   = 129
+        self.pos_end     = 161  # 129-160 (32個)
+
+        # 1. 属性ごとの FME モジュール (それぞれ独自の bias を持つことになる)
+        self.fme_pitch = FundamentalMusicEmbedding(d_model, base)
+        self.fme_bar   = FundamentalMusicEmbedding(d_model, base)
+        self.fme_pos   = FundamentalMusicEmbedding(d_model, base)
+
+        # 2. その他のトークン用 (EOS, PAD 等) の標準Embedding
+        # vocab_size 全体で確保し、該当箇所だけ使う（実装の簡易性のため）
+        self.embed_other = nn.Embedding(vocab_size, d_model)
+
+    def forward(self, x):
+        """
+        Args:
+            x: (Batch, Time) Token IDs (LongTensor)
+        Returns:
+            (Batch, Time, d_model) Combined Embeddings
+        """
+        # --- マスクの作成 ---
+        is_pitch = (x >= self.pitch_start) & (x < self.pitch_end)
+        is_bar   = (x == self.bar_token)
+        is_pos   = (x >= self.pos_start) & (x < self.pos_end)
+        # 上記以外 (例: 161~163)
+        is_other = ~(is_pitch | is_bar | is_pos)
+
+        # 出力用のバッファ確保
+        out = torch.zeros(x.size(0), x.size(1), self.d_model, device=x.device, dtype=torch.float)
+
+        # --- 1. Pitch FME 適用 ---
+        # Value: トークンID そのまま (0~127)
+        if is_pitch.any():
+            pitch_vals = x * is_pitch.long() # マスク外は0になるが加算時にマスクする
+            pitch_emb = self.fme_pitch(pitch_vals)
+            # 該当箇所だけ加算 (unsqueezeで次元合わせ: (B, T, 1))
+            out += pitch_emb * is_pitch.unsqueeze(-1)
+
+        # --- 2. Bar FME 適用 (特殊処理) ---
+        # Value: Barトークンの累積出現回数 (bar_0, bar_1, ...)
+        if is_bar.any():
+            # dim=1 (Time方向) に累積和をとる
+            # Barトークン以外は0なのでカウント増えない。Barトークンの位置に現在のBar数が入る。
+            # 例: [Pitch, Bar, Pitch, Bar] -> [0, 1, 0, 1] -> cumsum -> [0, 1, 1, 2]
+            # Barの位置の値を利用する。0 startにするため -1 する等の調整が可能だが、
+            # ここではシンプルに cumsum の値をそのまま絶対位置として使う (1 start)
+            # もし 0 start にしたい場合は (cumsum - 1) * mask などにする。
+            # ここでは bar_0 から始めたいので -1 します。
+            bar_counts = (x == self.bar_token).long().cumsum(dim=1) - 1
+            bar_counts = bar_counts.masked_fill(~is_bar, 0) # 安全のためマスク外を0に
             
+            bar_emb = self.fme_bar(bar_counts)
+            out += bar_emb * is_bar.unsqueeze(-1)
+
+        # --- 3. Pos FME 適用 ---
+        # Value: 相対位置 (0~31) に変換
+        if is_pos.any():
+            pos_vals = (x - self.pos_start) * is_pos.long()
+            pos_emb = self.fme_pos(pos_vals)
+            out += pos_emb * is_pos.unsqueeze(-1)
+
+        # --- 4. Other nn.Embedding 適用 ---
+        if is_other.any():
+            other_emb = self.embed_other(x)
+            out += other_emb * is_other.unsqueeze(-1)
+
         return out
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
