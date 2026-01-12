@@ -16,6 +16,49 @@ import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 # -----------------------------------------------------------------------------
+class FundamentalMusicEmbeddingOptimized(nn.Module):
+    def __init__(self, d_model, base=10000, apply_linear=True):
+        super().__init__()
+        self.d_model = d_model
+        
+        # 1. 計算済みの角度係数をバッファとして登録
+        # これにより model.to(device) した際に自動的にGPUへ移動し、state_dictにも保存される
+        i = torch.arange(d_model)
+        exponent = (2 * (i // 2)) / d_model
+        angle_rates = 1 / torch.pow(base, exponent)
+        self.register_buffer('angle_rates', angle_rates.view(1, 1, -1))
+        
+        # 2. 学習可能なバイアス
+        self.translation_bias = nn.Parameter(torch.randn(1, 1, d_model))
+        
+        # 3. オプションで線形層 (FME_v2の機能を取り込む場合)
+        if apply_linear:
+            self.linear = nn.Linear(d_model, d_model)
+        else:
+            self.linear = None
+
+    def forward(self, inp):
+        # inp shape: (batch, num_pitch)
+        
+        # ブロードキャストを利用して角度を計算 (batch, num_pitch, d_model)
+        x = inp.unsqueeze(-1)
+        angle_rads = x * self.angle_rates
+        
+        # sin/cos の適用
+        # メモリ効率のため empty_like を使用し、in-placeで代入
+        pos_encoding = torch.empty_like(angle_rads)
+        pos_encoding[..., 0::2] = torch.sin(angle_rads[..., 0::2])
+        pos_encoding[..., 1::2] = torch.cos(angle_rads[..., 1::2])
+        
+        # バイアスの加算
+        out = pos_encoding + self.translation_bias
+        
+        # 線形層の適用 (ある場合)
+        if self.linear is not None:
+            out = self.linear(out)
+            
+        return out
+# -----------------------------------------------------------------------------
 # Muon optimizer
 
 def zeropower_via_svd(G, steps=None):
