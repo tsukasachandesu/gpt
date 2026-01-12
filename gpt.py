@@ -487,8 +487,7 @@ for step in range(args.num_iterations + 1):
     timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
     # Set the attention blocksize for the current step, in chunks of 64. By @fernbear.bsky.social
-    max_attn_blocksize = max(64, min(T, 1792))
-    attn_blocksize = torch.tensor(64*((step/args.num_iterations * (max_attn_blocksize - 64) + 64)//64), dtype=torch.int, device='cuda')
+    attn_blocksize = torch.tensor(64*((step/args.num_iterations * (1792 - 64) + 64)//64), dtype=torch.int, device='cuda')
 
     # once in a while evaluate the validation dataset
     if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
