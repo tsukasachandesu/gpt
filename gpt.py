@@ -224,7 +224,7 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
-    vocab_size : int = 50304
+    vocab_size : int = 164
     n_layer : int = 12
     n_head : int = 6 # head dim 128 suggested by @Grad62304977
     n_embd : int = 768
@@ -251,7 +251,7 @@ class GPT(nn.Module):
 
     def forward(self, idx, target, attn_blocksize):
 
-        docs = (idx == 50256).cumsum(0)
+        docs = (idx == 163).cumsum(0)
         def document_causal_mask(b, h, q_idx, kv_idx):
           causal_mask = q_idx >= kv_idx
           document_mask = docs[q_idx] == docs[kv_idx]
@@ -362,8 +362,8 @@ class DistributedDataLoader:
 @dataclass
 class Hyperparameters:
     # data hyperparams
-    input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
-    input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
+    input_bin : str = 'train.bin' # input .bin to train on
+    input_val_bin : str = 'val.bin' # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 8 # batch size, in sequences, across all devices
     sequence_length : int = 2048 # sequence length, in tokens
@@ -433,7 +433,7 @@ x, y = train_loader.next_batch()
 
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
-num_vocab = 50304
+num_vocab = 164
 model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
 model = model.cuda().bfloat16()
 for m in model.modules():
