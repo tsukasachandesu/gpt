@@ -7,6 +7,7 @@ import glob
 import time
 import contextlib
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 import torch
@@ -267,7 +268,7 @@ class REMIPosPitchSinusoidalPE(nn.Module):
             return pe
         if x.shape != pe.shape:
             raise ValueError(f"x must be (B,T,d_model)=={tuple(pe.shape)}, got {tuple(x.shape)}")
-        return x + pe
+        return x + pe.to(dtype=x.dtype)
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -372,11 +373,18 @@ class GPTConfig:
     n_layer : int = 12
     n_head : int = 6 # head dim 128 suggested by @Grad62304977
     n_embd : int = 768
+    use_remi_pe : bool = True
+    pitch_start : int = 0
+    pitch_size : int = 128
+    pos_start : int = 129
+    pos_size : int = 32
+    bar_id : Optional[int] = 128
 
 class GPT(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        self.config = config
 
         # U-net design by @brendanh0gan
         self.num_encoder_layers = config.n_layer // 2 # Half of the layers for encoder
@@ -388,6 +396,14 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual learning
             vte = nn.Embedding(config.vocab_size, config.n_embd*12),
+            remi_pe = REMIPosPitchSinusoidalPE(
+                config.n_embd,
+                pos_start=config.pos_start,
+                pos_size=config.pos_size,
+                pitch_start=config.pitch_start,
+                pitch_size=config.pitch_size,
+                bar_id=config.bar_id,
+            ),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size)
@@ -407,9 +423,17 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         x = self.transformer.wte(idx[None]) # token embeddings of shape (b, t, n_embd)
+        if self.config.use_remi_pe:
+            pe = self.transformer.remi_pe(idx[None]).to(dtype=x.dtype)
+            x = x + pe
         x = norm(x) # @Grad62304977
         x0 = x
-        vi = self.transformer.vte(idx[None]).chunk(12, dim=-1)
+        vte = self.transformer.vte(idx[None])
+        if self.config.use_remi_pe:
+            vte = vte.view(1, S, 12, self.config.n_embd) + pe.unsqueeze(2)
+            vi = vte.unbind(dim=2)
+        else:
+            vi = vte.chunk(12, dim=-1)
 
         # Store outputs for U-Net skip connections
         skip_connections = []
