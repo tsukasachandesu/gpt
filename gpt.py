@@ -225,7 +225,7 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     vocab_size : int = 164
-    n_layer : int = 18
+    n_layer : int = 12
     n_head : int = 6 # head dim 128 suggested by @Grad62304977
     n_embd : int = 768
 
