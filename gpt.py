@@ -137,13 +137,17 @@ def forward_fill_from_updates(update_values: torch.Tensor, update_mask: torch.Te
     if update_values.shape != update_mask.shape:
         raise ValueError("shapes must match")
 
+    update_mask = update_mask.to(dtype=torch.bool)
+
     B, T = update_values.shape
     device = update_values.device
 
-    # 更新があった位置の時刻インデックス t を作り、累積最大で「直近の更新位置」を得る
-    t = torch.arange(T, device=device).expand(B, T)  # (B,T)
-    set_idx = torch.where(update_mask, t, torch.full_like(t, -1))  # 更新なしは -1
-    last_idx = torch.cummax(set_idx, dim=1).values.clamp_min(0)    # (B,T)
+    # (B,T) の時刻インデックス（expand は view なので実メモリは増えない）
+    t = torch.arange(T, device=device).view(1, T).expand(B, T)
+
+    # 更新があった位置だけ時刻を残し、累積最大で「直近の更新位置」を得る
+    set_idx = torch.where(update_mask, t, torch.full_like(t, -1))
+    last_idx = torch.cummax(set_idx, dim=1).values.clamp_min(0)
 
     # 更新値以外は 0 に落として、直近更新位置から gather
     updates = torch.where(update_mask, update_values, torch.zeros_like(update_values))
@@ -153,31 +157,37 @@ def forward_fill_from_updates(update_values: torch.Tensor, update_mask: torch.Te
 class SinusoidalEncoding1D(nn.Module):
     """
     1D sin/cos 位置エンコーディング
-    idx: (B,T) 等の整数テンソル -> (B,T,d_model)
+    idx: (...,) の整数テンソル -> (..., d_model)
     """
     def __init__(self, d_model: int, base: float = 10000.0, dtype: torch.dtype = torch.float32):
         super().__init__()
         if d_model % 2 != 0:
             raise ValueError("d_model must be even (sin/cos pairs).")
-        self.d_model = d_model
+        self.d_model = int(d_model)
         self.base = float(base)
 
+        # (d_model/2,)
         div_term = torch.exp(
-            torch.arange(0, d_model, 2, dtype=dtype) * (-math.log(self.base) / d_model)
-        )  # (d_model/2,)
+            torch.arange(0, self.d_model, 2, dtype=dtype) * (-math.log(self.base) / self.d_model)
+        )
         self.register_buffer("div_term", div_term, persistent=False)
 
     def forward(self, idx: torch.Tensor) -> torch.Tensor:
-        angle = idx.to(self.div_term.dtype).unsqueeze(-1) * self.div_term  # (..., d/2)
-        sin = torch.sin(angle)
-        cos = torch.cos(angle)
-        return torch.stack((sin, cos), dim=-1).flatten(-2)  # (..., d)
+        # angle: (..., d/2)
+        angle = idx.to(self.div_term.dtype).unsqueeze(-1) * self.div_term
+
+        # 出力: (..., d)
+        out_shape = angle.shape[:-1] + (self.d_model,)
+        pe = torch.empty(out_shape, device=angle.device, dtype=angle.dtype)
+        pe[..., 0::2] = torch.sin(angle)
+        pe[..., 1::2] = torch.cos(angle)
+        return pe
 
 
 class REMIPosPitchSinusoidalPE(nn.Module):
     """
-    sum-only: PE = PE_pos + PE_pitch(音符系のみ)
-    - Pos: 全トークンに付与（Position値を forward-fill）
+    sum-only: PE = PE_pos + PE_pitch（ただし付与範囲はゲート）
+    - Pos: posトークン または pitchトークンにのみ付与（要求仕様）
     - Pitch: 音符系トークンのみに付与（note_mask でゲート）
     """
     def __init__(
@@ -191,61 +201,67 @@ class REMIPosPitchSinusoidalPE(nn.Module):
         bar_id: Optional[int] = None,      # Barトークンがあるなら pos を 0 にリセット（PEにbar軸は入れない）
         base: float = 10000.0,
         dropout: float = 0.0,
-        scale: bool = True,                # True: 1/sqrt(2)（Pos+Pitch の分散を安定化）
+        normalize: bool = True,            # True: 有効成分数に応じて 1/sqrt(k) で正規化
         carry_pitch: bool = False,         # True: Pitchを forward-fill（音符属性トークンにも付与したい場合）
         reset_pitch_on_pos: bool = True,   # carry_pitch時、Pos/Barで pitch を 0 にリセット
     ):
         super().__init__()
-        self.d_model = d_model
+        self.d_model = int(d_model)
         self.pos_start = int(pos_start)
         self.pos_size = int(pos_size)
         self.pitch_start = int(pitch_start)
         self.pitch_size = int(pitch_size)
         self.bar_id = None if bar_id is None else int(bar_id)
 
-        self.scale = (1.0 / math.sqrt(2.0)) if scale else 1.0
+        self.normalize = bool(normalize)
         self.carry_pitch = bool(carry_pitch)
         self.reset_pitch_on_pos = bool(reset_pitch_on_pos)
 
-        self.enc = SinusoidalEncoding1D(d_model, base=base)
+        self.enc = SinusoidalEncoding1D(self.d_model, base=base)
         self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
     def forward(
         self,
-        token_ids: torch.Tensor,                 # (B,T) long
+        token_ids: torch.Tensor,                  # (B,T) long
         *,
-        x: Optional[torch.Tensor] = None,        # (B,T,d_model) を渡すと加算して返す
-        note_mask: Optional[torch.Tensor] = None # (B,T) bool。省略時は「Pitchトークンのみ」を音符系とみなす
+        x: Optional[torch.Tensor] = None,         # (B,T,d_model) を渡すと加算して返す
+        note_mask: Optional[torch.Tensor] = None  # (B,T) bool。省略時は pitchトークンのみ音符系とみなす
     ) -> torch.Tensor:
         if token_ids.ndim != 2:
             raise ValueError("token_ids must be (B,T)")
 
+        if token_ids.dtype not in (torch.int64, torch.int32, torch.int16, torch.int8, torch.uint8):
+            raise ValueError("token_ids must be an integer tensor")
+
+        B, T = token_ids.shape
+
         # --- トークン種別マスクと値 ---
         pos_tok = (token_ids >= self.pos_start) & (token_ids < self.pos_start + self.pos_size)
-        pos_val = (token_ids - self.pos_start).clamp_min(0)
-
         pitch_tok = (token_ids >= self.pitch_start) & (token_ids < self.pitch_start + self.pitch_size)
+
+        pos_val = (token_ids - self.pos_start).clamp_min(0)
         pitch_val = (token_ids - self.pitch_start).clamp_min(0)
 
         if self.bar_id is None:
-            bar_tok = torch.zeros_like(token_ids, dtype=torch.bool)
+            bar_tok = torch.zeros((B, T), device=token_ids.device, dtype=torch.bool)
         else:
             bar_tok = token_ids == self.bar_id
 
-        # 音符系ゲート：未指定なら簡略化REMIとして Pitchトークンのみを音符系扱い
+        # 音符系ゲート：未指定なら簡略化REMIとして pitchトークンのみを音符系扱い
         if note_mask is None:
             note_mask = pitch_tok
         else:
+            if note_mask.shape != (B, T):
+                raise ValueError("note_mask must be (B,T)")
             note_mask = note_mask.to(dtype=torch.bool)
 
-        # --- Pos: 全トークンに付与（Positionトークン、必要ならBarで更新/リセット）---
+        # --- Pos: Positionトークン（およびBarによる0リセット）を forward-fill してインデックス化 ---
         pos_update_mask = pos_tok | bar_tok
-        pos_update_val  = torch.where(pos_tok, pos_val, torch.zeros_like(pos_val))  # Barは0
-        pos_idx = forward_fill_from_updates(pos_update_val, pos_update_mask)        # (B,T)
+        pos_update_val = torch.where(pos_tok, pos_val, torch.zeros_like(pos_val))  # Barは0
+        pos_idx = forward_fill_from_updates(pos_update_val, pos_update_mask)       # (B,T)
 
-        # --- Pitch: 音符系のみに付与（note_maskでゲート）---
+        # --- Pitch: note_mask 付与の元になるピッチインデックス ---
         if self.carry_pitch:
-            # Pitchトークンで更新。reset_pitch_on_pos=TrueならPos/Barで0にリセットする更新も入れる
             pitch_update_mask = pitch_tok
             if self.reset_pitch_on_pos:
                 pitch_update_mask = pitch_update_mask | pos_tok | bar_tok
@@ -253,21 +269,36 @@ class REMIPosPitchSinusoidalPE(nn.Module):
             pitch_update_val = torch.where(pitch_tok, pitch_val, torch.zeros_like(pitch_val))
             pitch_idx = forward_fill_from_updates(pitch_update_val, pitch_update_mask)
         else:
-            # Pitchトークン以外は値を持たせない（ゲートで無効化するので0でOK）
             pitch_idx = torch.where(pitch_tok, pitch_val, torch.zeros_like(pitch_val))
 
-        # --- PE計算（sumのみ）---
-        pe_pos   = self.enc(pos_idx)    # (B,T,d)
-        pe_pitch = self.enc(pitch_idx)  # (B,T,d)
+        # --- PE計算 ---
+        pe_pos = self.enc(pos_idx)       # (B,T,d)
+        pe_pitch = self.enc(pitch_idx)   # (B,T,d)
 
-        gate = note_mask.to(dtype=pe_pos.dtype).unsqueeze(-1)  # (B,T,1)
-        pe = (pe_pos + pe_pitch * gate) * self.scale
+        # Pos は pos_tok または pitch_tok にのみ付与（要求仕様）
+        pos_gate = (pos_tok | pitch_tok).to(dtype=pe_pos.dtype).unsqueeze(-1)   # (B,T,1)
+        # Pitch は音符系（note_mask）にのみ付与
+        pitch_gate = note_mask.to(dtype=pe_pos.dtype).unsqueeze(-1)             # (B,T,1)
+
+        pe = pe_pos * pos_gate + pe_pitch * pitch_gate
+
+        # トークンごとに有効成分数で正規化（Posのみ / Pitchのみ / 両方 を安定化）
+        if self.normalize:
+            k = (pos_gate + pitch_gate).clamp_min(1.0)  # 0 は pe==0 なので 1 扱いでOK
+            pe = pe * torch.rsqrt(k)
+
         pe = self.drop(pe)
 
         if x is None:
             return pe
+
         if x.shape != pe.shape:
             raise ValueError(f"x must be (B,T,d_model)=={tuple(pe.shape)}, got {tuple(x.shape)}")
+
+        # dtype を合わせたい場合（例: x が fp16）に備えてキャスト
+        if pe.dtype != x.dtype:
+            pe = pe.to(dtype=x.dtype)
+            
         return x + pe.to(dtype=x.dtype)
 
 def norm(x):
