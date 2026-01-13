@@ -7,7 +7,6 @@ import glob
 import time
 import contextlib
 from dataclasses import dataclass
-from typing import Optional
 
 import numpy as np
 import torch
@@ -220,175 +219,13 @@ class Block(nn.Module):
         x = x + self.mlp(norm(x))
         return x
 
-class FundamentalMusicEmbeddingSlots(nn.Module):
-    """
-    FME: sin/cos + bias + (Option) learnable_scale
-    """
-    def __init__(
-        self,
-        d_model: int,
-        n_slots: int = 12,
-        base: float = 10000.0,
-        bias_init: str = "zeros",   # "zeros" or "normal"
-        bias_std: float = 0.02,
-        learnable_chunk_scale: bool = False,
-    ):
-        super().__init__()
-        if d_model % 2 != 0:
-            raise ValueError(f"d_model must be even for sin/cos pairs (got {d_model}).")
-
-        self.d_model = d_model
-        self.n_slots = n_slots
-        self.use_scale = learnable_chunk_scale
-
-        # 初期化計算は精度確保のため一時的にfloatで行うが、バッファとして登録後はモデルのdtypeに従う
-        i = torch.arange(d_model)
-        exponent = (2.0 * torch.div(i, 2, rounding_mode="floor")) / d_model
-        angle_rates = torch.pow(base, -exponent)
-        self.register_buffer("angle_rates", angle_rates, persistent=True)
-
-        # 1. Bias
-        if bias_init == "zeros":
-            bias = torch.zeros(n_slots, d_model)
-        elif bias_init == "normal":
-            bias = torch.randn(n_slots, d_model) * bias_std
-        else:
-            raise ValueError("bias_init must be 'zeros' or 'normal'")
-        self.translation_bias = nn.Parameter(bias)
-
-        # 2. Learnable Chunk Scale
-        if self.use_scale:
-            self.chunk_scale = nn.Parameter(torch.ones(n_slots, 1))
-
-    def forward(self, inp: torch.Tensor) -> torch.Tensor:
-        # inp: (N,), (N, T), etc.
-        # 計算はバッファ(angle_rates)の型に合わせて行い、最終出力はパラメータ(bias)の型に合わせる
-        
-        # 数値計算のために型を合わせる (half/bfloat16対応)
-        x = inp.to(dtype=self.angle_rates.dtype).reshape(-1)
-        angle_rads = x.unsqueeze(-1) * self.angle_rates  # (N, d_model)
-
-        # sin/cos計算
-        # sin/cosは入力と同じ型で計算される
-        base_enc = torch.empty_like(angle_rads)
-        base_enc[..., 0::2] = torch.sin(angle_rads[..., 0::2])
-        base_enc[..., 1::2] = torch.cos(angle_rads[..., 1::2])
-
-        # Bias加算のために、重みの型(translation_bias)にキャストする
-        # これにより、混合精度学習時に適切な型(FP16/BF16)で演算が行われる
-        out = base_enc.to(dtype=self.translation_bias.dtype)
-
-        # (N, 1, d) -> expand -> (N, n_slots, d)
-        out = out.unsqueeze(1).expand(-1, self.n_slots, -1) + self.translation_bias.unsqueeze(0)
-
-        # Scale適用
-        if self.use_scale:
-            out = out * self.chunk_scale.unsqueeze(0)
-
-        # (inp.shape..., n_slots * d_model) に整形
-        return out.reshape(*inp.shape, self.n_slots * self.d_model)
-
-class MusicVTE_FMEFast(nn.Module):
-    def __init__(
-        self,
-        vocab_size: int,
-        d_model: int,
-        n_slots: int = 12,
-        pitch_start: int = 0,
-        pitch_size: int = 128,
-        bar_start: int = 128,
-        bar_size: int = 1,
-        pos_start: int = 129,
-        pos_size: int = 32,
-        padding_idx: Optional[int] = None,
-        pitch_base: float = 10000.0,
-        bar_base: float = 10001.0,
-        pos_base: float = 10002.0,
-        fme_bias_init: str = "zeros",
-        fme_bias_std: float = 0.02,
-        learnable_chunk_scale: bool = False,
-    ):
-        super().__init__()
-        self.vocab_size = vocab_size
-        self.d_model = d_model
-        self.n_slots = n_slots
-
-        self.pitch_start, self.pitch_size = pitch_start, pitch_size
-        self.bar_start, self.bar_size = bar_start, bar_size
-        self.pos_start, self.pos_size = pos_start, pos_size
-
-        self.token_embed = nn.Embedding(vocab_size, d_model * n_slots, padding_idx=padding_idx)
-
-        self.pitch_fme = FundamentalMusicEmbeddingSlots(
-            d_model=d_model, n_slots=n_slots, base=pitch_base,
-            bias_init=fme_bias_init, bias_std=fme_bias_std,
-            learnable_chunk_scale=learnable_chunk_scale
-        )
-        self.bar_fme = FundamentalMusicEmbeddingSlots(
-            d_model=d_model, n_slots=n_slots, base=bar_base,
-            bias_init=fme_bias_init, bias_std=fme_bias_std,
-            learnable_chunk_scale=learnable_chunk_scale
-        )
-        self.pos_fme = FundamentalMusicEmbeddingSlots(
-            d_model=d_model, n_slots=n_slots, base=pos_base,
-            bias_init=fme_bias_init, bias_std=fme_bias_std,
-            learnable_chunk_scale=learnable_chunk_scale
-        )
-
-    def forward(self, idx: torch.Tensor) -> torch.Tensor:
-        # idx: (N, T) LongTensor
-        if idx.dim() < 1:
-            raise ValueError(f"idx must have at least 1 dim, got shape={tuple(idx.shape)}")
-
-        *prefix, T = idx.shape
-        idx2 = idx.reshape(-1, T)
-
-        # Token Embedding (通常のLook up)
-        emb = self.token_embed(idx2)
-        
-        # Embeddingの重みの型を取得 (fp32, fp16, bf16 等)
-        # 演算はこの型に合わせて行う
-        target_dtype = self.token_embed.weight.dtype
-
-        # マスク作成
-        pitch_mask = (idx2 >= self.pitch_start) & (idx2 < self.pitch_start + self.pitch_size)
-        pos_mask   = (idx2 >= self.pos_start)   & (idx2 < self.pos_start + self.pos_size)
-        bar_mask   = (idx2 >= self.bar_start)   & (idx2 < self.bar_start + self.bar_size)
-
-        # --- Pitch ---
-        if pitch_mask.any():
-            # 引き算結果を target_dtype にキャストしてから FME に渡す
-            pitch_val = (idx2[pitch_mask] - self.pitch_start).to(dtype=target_dtype)
-            pitch_emb = self.pitch_fme(pitch_val) # FME内部で適切にキャストされる
-            emb[pitch_mask] = pitch_emb
-
-        # --- Position ---
-        if pos_mask.any():
-            pos_val = (idx2[pos_mask] - self.pos_start).to(dtype=target_dtype)
-            pos_emb = self.pos_fme(pos_val)
-            emb[pos_mask] = pos_emb
-
-        # --- Bar ---
-        if bar_mask.any():
-            if self.bar_size == 1:
-                # barインデックスの計算 (Longのまま計算してからキャスト)
-                bar_index = torch.cumsum(bar_mask.long(), dim=1) - 1
-                bar_val = bar_index[bar_mask].to(dtype=target_dtype)
-            else:
-                bar_val = (idx2[bar_mask] - self.bar_start).to(dtype=target_dtype)
-
-            bar_emb = self.bar_fme(bar_val)
-            emb[bar_mask] = bar_emb
-
-        return emb.reshape(*prefix, T, self.d_model * self.n_slots)
-
 # -----------------------------------------------------------------------------
 # The main GPT-2 model
 
 @dataclass
 class GPTConfig:
     vocab_size : int = 164
-    n_layer : int = 16
+    n_layer : int = 18
     n_head : int = 6 # head dim 128 suggested by @Grad62304977
     n_embd : int = 768
 
@@ -404,15 +241,9 @@ class GPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
 
         self.transformer = nn.ModuleDict(dict(
-            wte = FundamentalMusicEmbeddingSlots(
-                d_model=config.n_embd,
-                n_slots=1,
-            ),
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
             # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual learning
-            vte = FundamentalMusicEmbeddingSlots(
-                d_model=config.n_embd,
-                n_slots=12,
-            ),
+            vte = nn.Embedding(config.vocab_size, config.n_embd*12),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size)
@@ -616,13 +447,7 @@ model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
 
 # init the optimizer(s)
-optimizer1 = torch.optim.Adam(
-    list(raw_model.transformer.wte.parameters())
-    + list(raw_model.transformer.vte.parameters()),
-    lr=0.6,
-    betas=(0.8, 0.95),
-    fused=True,
-)
+optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight, raw_model.transformer.vte.weight], lr=0.6, betas=(0.8, 0.95), fused=True)
 optimizer2 = torch.optim.Adam([raw_model.lm_head.weight], lr=0.008, betas=(0.8, 0.95), fused=True)
 params = list(raw_model.transformer.h.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
