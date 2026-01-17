@@ -11,7 +11,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from collections import defaultdict
-from itertools import accumulate
+from itertools import accumulate, cycle
 from pathlib import Path
 import gc
 
@@ -28,220 +28,10 @@ import torch.nn.functional as F
 # torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
 import triton
 import triton.language as tl
-from triton.tools.tensor_descriptor import TensorDescriptor
-from torch.nn.attention.flex_attention import BlockMask, flex_attention, create_block_mask
-from torch.utils._pytree import register_pytree_node
+from torch.nn.attention.flex_attention import BlockMask, flex_attention
 from torch import Tensor, nn
 
 dynamo.config.recompile_limit = 64
-
-# -----------------------------------------------------------------------------
-# flex_attention / BlockMask helpers for torch.compile(fullgraph=True)
-#
-# 1) BlockMask objects are passed through the compiled graph. If BlockMask is not
-#    registered as a pytree, torch.compile will often treat each new BlockMask
-#    instance as a distinct Python object and trigger recompilation.
-#
-# 2) flex_attention lowers the BlockMask by calling block_mask.as_tuple() while
-#    dynamo is tracing. The returned tuple contains the Python callable
-#    `mask_mod`. For torch.compile(fullgraph=True), `mask_mod` must be a stable
-#    (global) callable; nested closures frequently break dynamo.
-
-def _register_blockmask_pytree() -> None:
-    """Register BlockMask as a pytree node (idempotent)."""
-    # In some PyTorch versions BlockMask may already be registered; re-registering
-    # will raise.
-    try:
-        def _flatten(bm: BlockMask):
-            children = (
-                bm.kv_num_blocks,
-                bm.kv_indices,
-                bm.full_kv_num_blocks,
-                bm.full_kv_indices,
-                bm.q_num_blocks,
-                bm.q_indices,
-                bm.full_q_num_blocks,
-                bm.full_q_indices,
-            )
-            aux_data = (bm.BLOCK_SIZE, bm.mask_mod)
-            return children, aux_data
-
-        def _unflatten(aux_data, children):
-            (BLOCK_SIZE, mask_mod) = aux_data
-            (
-                kv_num_blocks,
-                kv_indices,
-                full_kv_num_blocks,
-                full_kv_indices,
-                q_num_blocks,
-                q_indices,
-                full_q_num_blocks,
-                full_q_indices,
-            ) = children
-            return BlockMask(
-                kv_num_blocks,
-                kv_indices,
-                full_kv_num_blocks,
-                full_kv_indices,
-                q_num_blocks,
-                q_indices,
-                full_q_num_blocks,
-                full_q_indices,
-                BLOCK_SIZE=BLOCK_SIZE,
-                mask_mod=mask_mod,
-            )
-
-        register_pytree_node(BlockMask, _flatten, _unflatten)
-    except Exception:
-        # Best-effort: if it's already registered (or API differs), keep going.
-        pass
-
-
-_register_blockmask_pytree()
-
-
-# Global buffers read by the (global) mask_mod callables. These buffers MUST NOT
-# be rebound after compilation; only update their *contents*.
-_FA_DOC_ID: Tensor | None = None
-_FA_DOC_LEN: Tensor | None = None
-_FA_WIN_SHORT: Tensor | None = None
-_FA_WIN_LONG: Tensor | None = None
-
-_FA_DOC_ID_PAIRED: Tensor | None = None
-_FA_DOC_LEN_PAIRED: Tensor | None = None
-_FA_WIN_SHORT_PAIRED: Tensor | None = None
-_FA_WIN_LONG_PAIRED: Tensor | None = None
-
-
-def _fa_init_globals(device: torch.device, *, max_len: int, max_len_paired: int) -> None:
-    """Allocate the global buffers used by flex_attention mask_mod functions."""
-    global _FA_DOC_ID, _FA_DOC_LEN, _FA_WIN_SHORT, _FA_WIN_LONG
-    global _FA_DOC_ID_PAIRED, _FA_DOC_LEN_PAIRED, _FA_WIN_SHORT_PAIRED, _FA_WIN_LONG_PAIRED
-
-    if _FA_DOC_ID is not None:
-        # Already initialized; assume sizes were chosen to cover all later calls.
-        return
-
-    _FA_DOC_ID = torch.empty((max_len,), device=device, dtype=torch.int32)
-    _FA_DOC_LEN = torch.zeros((), device=device, dtype=torch.int32)
-    _FA_WIN_SHORT = torch.zeros((), device=device, dtype=torch.int32)
-    _FA_WIN_LONG = torch.zeros((), device=device, dtype=torch.int32)
-
-    _FA_DOC_ID_PAIRED = torch.empty((max_len_paired,), device=device, dtype=torch.int32)
-    _FA_DOC_LEN_PAIRED = torch.zeros((), device=device, dtype=torch.int32)
-    _FA_WIN_SHORT_PAIRED = torch.zeros((), device=device, dtype=torch.int32)
-    _FA_WIN_LONG_PAIRED = torch.zeros((), device=device, dtype=torch.int32)
-
-
-def _fa_set_windows(*, short_win: int, long_win: int) -> None:
-    assert _FA_WIN_SHORT is not None and _FA_WIN_LONG is not None
-    # Store as int32 scalars on device.
-    _FA_WIN_SHORT.fill_(short_win)
-    _FA_WIN_LONG.fill_(long_win)
-
-
-def _fa_set_windows_paired(*, short_win: int, long_win: int) -> None:
-    assert _FA_WIN_SHORT_PAIRED is not None and _FA_WIN_LONG_PAIRED is not None
-    _FA_WIN_SHORT_PAIRED.fill_(short_win)
-    _FA_WIN_LONG_PAIRED.fill_(long_win)
-
-
-def _fa_update_doc_id(cu_seqlens: Tensor, total_len: int) -> None:
-    """Compute per-token document ids (for document packing) into global buffers."""
-    assert _FA_DOC_ID is not None and _FA_DOC_LEN is not None
-    # NOTE: create_block_mask may internally round lengths; mask_mod will guard
-    # indices via _FA_DOC_LEN.
-    _FA_DOC_LEN.fill_(total_len)
-    pos = torch.arange(total_len, device=cu_seqlens.device)
-    doc_id = torch.bucketize(pos, cu_seqlens[1:], right=False).to(torch.int32)
-    _FA_DOC_ID[:total_len].copy_(doc_id)
-
-
-def _fa_update_doc_id_paired(cu_seqlens_p: Tensor, total_len_p: int) -> None:
-    assert _FA_DOC_ID_PAIRED is not None and _FA_DOC_LEN_PAIRED is not None
-    _FA_DOC_LEN_PAIRED.fill_(total_len_p)
-    pos = torch.arange(total_len_p, device=cu_seqlens_p.device)
-    doc_id = torch.bucketize(pos, cu_seqlens_p[1:], right=False).to(torch.int32)
-    _FA_DOC_ID_PAIRED[:total_len_p].copy_(doc_id)
-
-
-def _fa_doc_causal_window_mask_impl(
-    *,
-    doc_id_buf: Tensor,
-    doc_len: Tensor,
-    window: Tensor,
-    q_idx: Tensor,
-    kv_idx: Tensor,
-) -> Tensor:
-    """Mask: same-document AND causal AND sliding-window, with padding safety."""
-    # create_block_mask may call mask_mod with indices in the rounded-up range.
-    doc_len_i = doc_len.to(dtype=q_idx.dtype)
-    win_i = window.to(dtype=q_idx.dtype)
-
-    valid = (q_idx < doc_len_i) & (kv_idx < doc_len_i)
-    # Clamp indices to prevent out-of-bounds indexing even when valid is false.
-    # (This is needed because create_block_mask may pad KV_LEN/Q_LEN.)
-    max_idx = torch.clamp(doc_len_i - 1, min=0)
-    q_i = torch.clamp(q_idx, 0, max_idx)
-    kv_i = torch.clamp(kv_idx, 0, max_idx)
-
-    same_doc = doc_id_buf[q_i] == doc_id_buf[kv_i]
-    causal = q_idx >= kv_idx
-    window_mask = (q_idx - kv_idx) <= win_i
-    return valid & same_doc & causal & window_mask
-
-
-# Stable (global) mask_mod callables consumed by create_block_mask / flex_attention.
-def _fa_mask_mod_short(b: Tensor, h: Tensor, q_idx: Tensor, kv_idx: Tensor) -> Tensor:
-    assert _FA_DOC_ID is not None and _FA_DOC_LEN is not None and _FA_WIN_SHORT is not None
-    return _fa_doc_causal_window_mask_impl(
-        doc_id_buf=_FA_DOC_ID,
-        doc_len=_FA_DOC_LEN,
-        window=_FA_WIN_SHORT,
-        q_idx=q_idx,
-        kv_idx=kv_idx,
-    )
-
-
-def _fa_mask_mod_long(b: Tensor, h: Tensor, q_idx: Tensor, kv_idx: Tensor) -> Tensor:
-    assert _FA_DOC_ID is not None and _FA_DOC_LEN is not None and _FA_WIN_LONG is not None
-    return _fa_doc_causal_window_mask_impl(
-        doc_id_buf=_FA_DOC_ID,
-        doc_len=_FA_DOC_LEN,
-        window=_FA_WIN_LONG,
-        q_idx=q_idx,
-        kv_idx=kv_idx,
-    )
-
-
-def _fa_mask_mod_short_paired(b: Tensor, h: Tensor, q_idx: Tensor, kv_idx: Tensor) -> Tensor:
-    assert (
-        _FA_DOC_ID_PAIRED is not None
-        and _FA_DOC_LEN_PAIRED is not None
-        and _FA_WIN_SHORT_PAIRED is not None
-    )
-    return _fa_doc_causal_window_mask_impl(
-        doc_id_buf=_FA_DOC_ID_PAIRED,
-        doc_len=_FA_DOC_LEN_PAIRED,
-        window=_FA_WIN_SHORT_PAIRED,
-        q_idx=q_idx,
-        kv_idx=kv_idx,
-    )
-
-
-def _fa_mask_mod_long_paired(b: Tensor, h: Tensor, q_idx: Tensor, kv_idx: Tensor) -> Tensor:
-    assert (
-        _FA_DOC_ID_PAIRED is not None
-        and _FA_DOC_LEN_PAIRED is not None
-        and _FA_WIN_LONG_PAIRED is not None
-    )
-    return _fa_doc_causal_window_mask_impl(
-        doc_id_buf=_FA_DOC_ID_PAIRED,
-        doc_len=_FA_DOC_LEN_PAIRED,
-        window=_FA_WIN_LONG_PAIRED,
-        q_idx=q_idx,
-        kv_idx=kv_idx,
-    )
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
@@ -1249,11 +1039,14 @@ class YarnPairedHead(nn.Module):
 class AttnArgs:
     ve: torch.Tensor
     sa_lambdas: torch.Tensor
+    seqlens: torch.Tensor
+    bm_size: int
     yarn: Yarn
     key_offset: bool
     attn_gate_w: torch.Tensor
     ve_gate_w: torch.Tensor
-    block_mask: object
+    block_mask: BlockMask | None = None
+
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
@@ -1279,12 +1072,11 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: Tensor, attn_args: AttnArgs):
         B, T = x.size(0), x.size(1) # batch size, sequence length
-        assert B == 1, "varlen sequences requires B == 1"
+        assert B == 1, "Must use batch size = 1 for FlexAttention"
         assert T % 16 == 0
         # unpack attention args
         yarn = attn_args.yarn
         ve, sa_lambdas, key_offset = attn_args.ve, attn_args.sa_lambdas, attn_args.key_offset
-        block_mask = attn_args.block_mask
         # sparse gated attention to enable context based no-op by @classiclarryd
         # only include gates on layers with value embeds used on forward pass
         attn_gate_w, ve_gate_w = attn_args.attn_gate_w, attn_args.ve_gate_w
@@ -1299,15 +1091,17 @@ class CausalSelfAttention(nn.Module):
         if ve is not None:
             ve_gate_out = 2 * torch.sigmoid(F.linear(x[..., :12], ve_gate_w)).view(B, T, self.num_heads, 1)
             v = v + ve_gate_out * ve.view_as(v) # @ KoszarskyB & @Grad62304977
+        block_mask = attn_args.block_mask
+        assert block_mask is not None, 'block_mask must be provided for FlexAttention'
 
-        # FlexAttention expects (B, H, L, D)
+        # FlexAttention (document + causal + sliding-window)
         y = flex_attention(
             q.transpose(1, 2),
             k.transpose(1, 2),
             v.transpose(1, 2),
             block_mask=block_mask,
             scale=yarn.attn_scale,
-        ).transpose(1, 2).contiguous()
+        ).transpose(1, 2)
         y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = F.linear(y, sa_lambdas[1] * self.qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
@@ -1338,12 +1132,11 @@ class PairedHeadCausalSelfAttention(nn.Module):
 
     def forward(self, x: Tensor, attn_args: AttnArgs):
         B, T = x.size(0), x.size(1) # batch size, sequence length
-        assert B == 1, "varlen sequences requires B == 1"
+        assert B == 1, "Must use batch size = 1 for FlexAttention"
         assert T % 16 == 0
         # unpack attention args
         yarn = attn_args.yarn
         ve, sa_lambdas = attn_args.ve, attn_args.sa_lambdas
-        block_mask = attn_args.block_mask
         attn_gate_w, ve_gate_w = attn_args.attn_gate_w, attn_args.ve_gate_w
 
         q, k, v = F.linear(x, sa_lambdas[0] * self.qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
@@ -1362,154 +1155,22 @@ class PairedHeadCausalSelfAttention(nn.Module):
         if ve is not None:
             ve_gate_out = 2 * torch.sigmoid(F.linear(x[..., :12], ve_gate_w)).view(B, T*2, self.num_heads//2, 1)
             v = v + ve_gate_out * ve.view_as(v)
+        block_mask = attn_args.block_mask
+        assert block_mask is not None, 'block_mask must be provided for FlexAttention'
 
-        # FlexAttention expects (B, H, L, D)
+        # FlexAttention (paired-head interleaved sequence)
         y = flex_attention(
             q.transpose(1, 2),
             k.transpose(1, 2),
             v.transpose(1, 2),
             block_mask=block_mask,
             scale=yarn.attn_scale,
-        ).transpose(1, 2).contiguous()
-        y = y.view(B, T, self.num_heads, self.head_dim)
+        ).transpose(1, 2)
+        y = y.contiguous().view(B, T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
         y = F.linear(y, sa_lambdas[1] * self.qkvo_w[self.dim * 3:].type_as(y))
         return y
-
-@triton.jit
-def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
-                                 M, N, K,
-                                 BLOCK_SIZE_M: tl.constexpr,
-                                 BLOCK_SIZE_N: tl.constexpr,
-                                 BLOCK_SIZE_K: tl.constexpr,
-                                 GROUP_SIZE_M: tl.constexpr,
-                                 NUM_SMS: tl.constexpr,
-                                 FORWARD: tl.constexpr,
-                                 ):
-    dtype = tl.bfloat16
-    start_pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
-    num_tiles = num_pid_m * num_pid_n
-
-    tile_id_c = start_pid - NUM_SMS
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-
-    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
-        pid_m = tile_id // num_pid_n
-        pid_n = tile_id % num_pid_n
-        offs_am = pid_m * BLOCK_SIZE_M
-        offs_bn = pid_n * BLOCK_SIZE_N
-
-        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        for ki in range(k_tiles):
-            offs_k = ki * BLOCK_SIZE_K
-            a = a_desc.load([offs_am, offs_k])
-            b = b_desc.load([offs_bn, offs_k])
-            accumulator = tl.dot(a, b.T, accumulator)
-
-        tile_id_c += NUM_SMS
-        pid_m = tile_id // num_pid_n
-        pid_n = tile_id % num_pid_n
-        offs_am_c = pid_m * BLOCK_SIZE_M
-        offs_bn_c = pid_n * BLOCK_SIZE_N
-
-        acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
-        acc = tl.permute(acc, (0, 2, 1))
-        acc0, acc1 = tl.split(acc)
-
-        c0 = acc0.to(dtype)
-        if not FORWARD:
-            c0_pre = aux_desc.load([offs_am_c, offs_bn_c])
-            c0 = 2 * c0 * tl.where(c0_pre > 0, c0_pre, 0)
-
-        c_desc.store([offs_am_c, offs_bn_c], c0)
-
-        if FORWARD:
-            c0_post = tl.maximum(c0, 0)
-            c0_post = c0_post * c0_post
-            aux_desc.store([offs_am_c, offs_bn_c], c0_post)
-
-        c1 = acc1.to(dtype)
-        if not FORWARD:
-            c1_pre = aux_desc.load([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2])
-            c1 = 2 * c1 * tl.where(c1_pre > 0, c1_pre, 0)
-
-        c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
-
-        if FORWARD:
-            c1_post = tl.maximum(c1, 0)
-            c1_post = c1_post * c1_post
-            aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
-
-
-def linear_relu_square(a, b, aux=None):
-    M, K = a.shape
-    N, K = b.shape
-    dtype = a.dtype
-
-    c = torch.empty((M, N), device=a.device, dtype=dtype)
-
-    FORWARD = False
-    if aux is None:
-        FORWARD = True
-        aux = torch.empty((M, N), device=a.device, dtype=dtype)
-
-    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
-
-    BLOCK_SIZE_M = 128
-    BLOCK_SIZE_N = 256
-    BLOCK_SIZE_K = 64
-    num_stages = 4 if FORWARD else 3
-    num_warps = 8
-
-    a_desc = TensorDescriptor.from_tensor(a, [BLOCK_SIZE_M, BLOCK_SIZE_K])
-    b_desc = TensorDescriptor.from_tensor(b, [BLOCK_SIZE_N, BLOCK_SIZE_K])
-    c_desc = TensorDescriptor.from_tensor(c, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
-    aux_desc = TensorDescriptor.from_tensor(aux, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
-
-    def grid(META):
-        return (min(
-            NUM_SMS,
-            triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),
-        ), )
-
-    linear_relu_square_kernel[grid](
-        a_desc, b_desc, c_desc, aux_desc,
-        M, N, K,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        GROUP_SIZE_M=1,
-        NUM_SMS=NUM_SMS,
-        FORWARD=FORWARD,
-        num_stages=num_stages,
-        num_warps=num_warps
-    )
-
-    if FORWARD:
-        return c, aux
-    else:
-        return c
-
-class FusedLinearReLUSquareFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, W1, W2):
-        pre, post = linear_relu_square(x.view((-1, x.shape[-1])), W1)
-        x3 = post @ W2
-        ctx.save_for_backward(x, W1, W2, pre, post)
-        return x3.view(x.shape)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        x, W1, W2, pre, post = ctx.saved_tensors
-        dW2 = post.T @ grad_output
-        dpre = linear_relu_square(grad_output.view((-1, grad_output.shape[-1])), W2, aux=pre)
-        dW1 = dpre.T @ x
-        dx = dpre @ W1
-        return dx.view(x.shape), dW1, dW2
 
 class MLP(nn.Module):
     def __init__(self, dim: int):
@@ -1564,27 +1225,7 @@ class ForwardScheduleConfig:
     mtp_weights: torch.Tensor
     ws_short: int
     ws_long: int
-    bm_short: object
-    bm_long: object
-    bm_short_paired: object
-    bm_long_paired: object
 
-
-
-# -----------------------------------------------------------------------------
-# FlexAttention BlockMask helpers
-
-def _build_flex_block_mask(*, total_len: int, device: torch.device, mask_mod) -> BlockMask:
-    """Create a BlockMask using a *global* (stable) mask_mod callable."""
-    return create_block_mask(
-        mask_mod,
-        B=None,
-        H=None,
-        Q_LEN=total_len,
-        KV_LEN=total_len,
-        device=str(device),
-        BLOCK_SIZE=args.block_size,
-    )
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
         super().__init__()
@@ -1664,6 +1305,66 @@ class GPT(nn.Module):
 
         self.split_embed = False
 
+
+
+    def create_blockmasks(self, input_seq: Tensor, ws_long: int, ws_short: int, *, paired: bool = False):
+        """Create FlexAttention BlockMasks for (long, short) sliding-window attention.
+
+        This is adapted from the older flex-attention version (1.py):
+        - Document boundaries are inferred from BOS tokens (50256)
+        - Within each document we apply causal + sliding-window attention
+        - We split the mask into "full" blocks (no mask_mod needed) and "partial" blocks
+        """
+        BLOCK_SIZE = args.block_size  # typically 128
+        # doc ids: increment at each BOS. Works with packed documents.
+        docs = (input_seq == BOS_ID).cumsum(0)
+        if paired:
+            # Paired-head attention interleaves tokens, doubling sequence length.
+            # Map interleaved positions back to original token indices via repeat_interleave(2).
+            docs = docs.repeat_interleave(2)
+
+        def document_causal(b, h, q_idx, kv_idx):
+            causal_mask = q_idx >= kv_idx
+            document_mask = docs[q_idx] == docs[kv_idx]
+            return causal_mask & document_mask
+
+        def dense_to_ordered(dense_blockmask: Tensor):
+            num_blocks = dense_blockmask.sum(dim=-1, dtype=torch.int32)
+            indices = dense_blockmask.argsort(dim=-1, descending=False, stable=True).flip(-1).to(torch.int32)
+            return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
+
+        # manual block mask creation (adapted from 1.py)
+        assert docs.numel() % BLOCK_SIZE == 0
+        num_blocks_total = docs.numel() // BLOCK_SIZE
+        block_idx = torch.arange(num_blocks_total, dtype=torch.int32, device=docs.device)
+
+        causal_blockmask_any = block_idx[:, None] >= block_idx
+        causal_blockmask_all = block_idx[:, None] > block_idx
+
+        docs_low = docs.view(-1, BLOCK_SIZE)[:, 0].contiguous()
+        docs_high = docs.view(-1, BLOCK_SIZE)[:, -1].contiguous()
+        document_blockmask_any = (docs_low[:, None] <= docs_high) & (docs_high[:, None] >= docs_low)
+        document_blockmask_all = (docs_low[:, None] == docs_high) & (docs_high[:, None] == docs_low)
+
+        blockmask_any = causal_blockmask_any & document_blockmask_any
+        blockmask_all = causal_blockmask_all & document_blockmask_all
+
+        partial_kv_num_blocks, partial_kv_indices = dense_to_ordered(blockmask_any & ~blockmask_all)
+        full_kv_num_blocks, full_kv_indices = dense_to_ordered(blockmask_all)
+
+        def build_bm(window_size_blocks: int) -> BlockMask:
+            # keep window size as int32 tensor on the same device
+            w = torch.tensor(window_size_blocks, dtype=torch.int32, device=docs.device)
+            return BlockMask.from_kv_blocks(
+                torch.clamp_max(partial_kv_num_blocks, torch.clamp_min(w - full_kv_num_blocks, 1)),
+                partial_kv_indices,
+                torch.clamp_max(full_kv_num_blocks, w - 1),
+                full_kv_indices,
+                BLOCK_SIZE=BLOCK_SIZE,
+                mask_mod=document_causal,
+            )
+
+        return build_bm(ws_long), build_bm(ws_short)
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
 
@@ -1692,6 +1393,22 @@ class GPT(nn.Module):
         assert len(bm_sizes) == self.num_layers
         key_offset = [b==long_bm for b in bm_sizes] # apply partial key offset to long windows
 
+        # FlexAttention block masks (BOS-delimited packed documents)
+        long_bm_mask, short_bm_mask = self.create_blockmasks(input_seq, ws_long, ws_short, paired=False)
+        long_bm_mask_paired, short_bm_mask_paired = self.create_blockmasks(input_seq, ws_long, ws_short, paired=True)
+
+        block_masks: list[BlockMask | None] = []
+        for i, bm in enumerate(bm_sizes):
+            if bm is None:
+                block_masks.append(None)
+                continue
+            is_long = (bm == long_bm)
+            if i in self.paired_head_layers:
+                block_masks.append(long_bm_mask_paired if is_long else short_bm_mask_paired)
+            else:
+                block_masks.append(long_bm_mask if is_long else short_bm_mask)
+        assert len(block_masks) == self.num_layers
+
         # weight-tied: use lm_head.weight for embedding lookup (or separate embed after split)
         if self.split_embed:
             x = self.embed(input_seq)
@@ -1718,22 +1435,16 @@ class GPT(nn.Module):
 
         for i in range(self.num_layers):
             yarn = self.yarn_paired_head if i in self.paired_head_layers else self.yarn
-            # select precomputed FlexAttention BlockMask
-            if self.blocks[i].attn is None:
-                block_mask = None
-            elif i in self.paired_head_layers:
-                block_mask = schedule_cfg.bm_long_paired if bm_sizes[i] == long_bm else schedule_cfg.bm_short_paired
-            else:
-                block_mask = schedule_cfg.bm_long if bm_sizes[i] == long_bm else schedule_cfg.bm_short
-
             attn_args = AttnArgs(
                 ve=ve[i],
                 sa_lambdas=sa_lambdas[i],
+                seqlens=seqlens,
+                bm_size=bm_sizes[i],
                 yarn=yarn,
                 key_offset=key_offset[i],
                 attn_gate_w=attn_gates[i],
                 ve_gate_w=ve_gates[i],
-                block_mask=block_mask,
+                block_mask=block_masks[i],
             )
             if i in skip_out:
                 skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
@@ -1888,7 +1599,8 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {filename_pattern}")
 
-    file_iter = iter(files)  # Use itertools.cycle(files) for multi-epoch training
+    # Single-file training should never exhaust; cycle it to avoid StopIteration in preloader.
+    file_iter = cycle(files) if len(files) == 1 else iter(files)
     tokens = _load_data_shard(next(file_iter))
     if align_to_bos:
         finder = BOSFinder(tokens, world_size=world_size, quickload=True)
@@ -2081,42 +1793,11 @@ class TrainingManager():
     def apply_final_ws_ext(self):
         self.ws_long = args.ws_validate_post_yarn_ext
 
-    def get_forward_args(self, cum_seqlens: Tensor, seq_len: int):
-        """Build per-call ForwardScheduleConfig including FlexAttention BlockMasks."""
-        # window sizes in tokens
-        short_bm = self.ws_short * args.block_size
-        long_bm = self.ws_long * args.block_size
-
-        # Update global mask state (doc ids and windows) once per forward call.
-        _fa_set_windows(short_win=short_bm, long_win=long_bm)
-        _fa_update_doc_id(cum_seqlens, seq_len)
-
-        # standard (non-paired) masks
-        bm_short = _build_flex_block_mask(total_len=seq_len, device=cum_seqlens.device, mask_mod=_fa_mask_mod_short)
-        bm_long = _build_flex_block_mask(total_len=seq_len, device=cum_seqlens.device, mask_mod=_fa_mask_mod_long)
-
-        # paired-head masks operate on the interleaved sequence (length *2).
-        # IMPORTANT: distances in the interleaved representation are doubled, so
-        # we double the window size in tokens.
-        cum_seqlens_p = cum_seqlens * 2
-        seq_len_p = seq_len * 2
-        _fa_set_windows_paired(short_win=2 * short_bm, long_win=2 * long_bm)
-        _fa_update_doc_id_paired(cum_seqlens_p, seq_len_p)
-        bm_short_paired = _build_flex_block_mask(
-            total_len=seq_len_p, device=cum_seqlens.device, mask_mod=_fa_mask_mod_short_paired
-        )
-        bm_long_paired = _build_flex_block_mask(
-            total_len=seq_len_p, device=cum_seqlens.device, mask_mod=_fa_mask_mod_long_paired
-        )
-
+    def get_forward_args(self):
         return ForwardScheduleConfig(
-            mtp_weights=self.mtp_weights,
-            ws_short=self.ws_short,
-            ws_long=self.ws_long,
-            bm_short=bm_short,
-            bm_long=bm_long,
-            bm_short_paired=bm_short_paired,
-            bm_long_paired=bm_long_paired,
+            mtp_weights = self.mtp_weights,
+            ws_short = self.ws_short,
+            ws_long = self.ws_long
         )
     
     def _is_active_step(self, opt, step: int):
@@ -2203,10 +1884,10 @@ class Hyperparameters:
     val_files: str = "val.bin" # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
-    train_bs_schedule: tuple = (2048, 2 * 2048, 3 * 2048)
-    train_bs_extension: int = 3 * 2048 
+    train_bs_schedule: tuple = (8 * 2048 , 16 * 2048, 24 * 2048)
+    train_bs_extension: int = 24 * 2048 
     train_max_seq_len: int = 128 * 16
-    val_batch_size: int = 4 * 8 * 1024 
+    val_batch_size: int = 4 * 64 * 1024 
     # optimization
     num_scheduled_iterations: int = 1735  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
@@ -2241,13 +1922,6 @@ dist.init_process_group(backend="nccl", device_id=device)
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
-# Initialize flex_attention mask globals once (MUST be done before the first
-# compiled forward so that the compiled graph captures stable tensor objects).
-_max_tokens = max(max(args.train_bs_schedule), args.val_batch_size)
-_max_len = _max_tokens // (grad_accum_steps * world_size)
-_max_len = ((_max_len + args.block_size - 1) // args.block_size) * args.block_size
-_fa_init_globals(device, max_len=_max_len, max_len_paired=2 * _max_len)
-
 # begin logging
 logfile = None
 if master_process:
@@ -2277,7 +1951,7 @@ print0(nvidia_smi())
 print0("="*100)
 
 model: nn.Module = GPT(
-    vocab_size=164,
+    vocab_size=50257,
     num_layers=11,
     num_heads=6,
     head_dim=128,
@@ -2314,7 +1988,7 @@ for step in warmup_steps:
     model.eval()
     with torch.no_grad():
         inputs, targets, cum_seqlens = next(val_loader)
-        model(inputs, targets, cum_seqlens, training_manager.get_forward_args(cum_seqlens, inputs.size(0)))
+        model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
     model.train()
     for idx in range(grad_accum_steps):
         # enable gradient sync for the DistAdam optimizers on the last iteration before we step them
@@ -2322,7 +1996,7 @@ for step in warmup_steps:
             training_manager.activate_hooks(step)
         send_args = training_manager.train_loader_send_args
         inputs, targets, cum_seqlens = train_loader.send(send_args)
-        (model(inputs, targets, cum_seqlens, training_manager.get_forward_args(cum_seqlens, inputs.size(0))) / grad_accum_steps).backward()
+        (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / grad_accum_steps).backward()
     training_manager.step_optimizers(step)
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
@@ -2362,7 +2036,7 @@ for step in range(train_steps + 1):
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets, cum_seqlens = next(val_loader)
-                val_loss += model(inputs, targets, cum_seqlens, training_manager.get_forward_args(cum_seqlens, inputs.size(0)))
+                val_loss += model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
         val_loss /= val_steps
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
@@ -2387,7 +2061,7 @@ for step in range(train_steps + 1):
             training_manager.activate_hooks(step)
         send_args = training_manager.train_loader_send_args
         inputs, targets, cum_seqlens = train_loader.send(send_args)
-        (model(inputs, targets, cum_seqlens, training_manager.get_forward_args(cum_seqlens, inputs.size(0))) / grad_accum_steps).backward()
+        (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / grad_accum_steps).backward()
     training_manager.step_optimizers(step)
 
     # logging
