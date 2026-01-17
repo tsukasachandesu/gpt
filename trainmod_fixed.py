@@ -1882,12 +1882,12 @@ class Hyperparameters:
     # data
     train_files: str = "train.bin" # input .bin to train on
     val_files: str = "val.bin" # input .bin to eval validation loss on
-    val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    val_tokens: int = 4 *  24 * 2048 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
-    train_bs_schedule: tuple = (8 * 2048 , 16 * 2048, 24 * 2048)
-    train_bs_extension: int = 24 * 2048 
+    train_bs_schedule: tuple = (2 * 8 * 2048 ,2 *  16 * 2048,2 *  24 * 2048)
+    train_bs_extension: int = 2 *  24 * 2048 
     train_max_seq_len: int = 128 * 16
-    val_batch_size: int = 4 * 64 * 1024 
+    val_batch_size: int = 2 *  24 * 2048
     # optimization
     num_scheduled_iterations: int = 1735  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
