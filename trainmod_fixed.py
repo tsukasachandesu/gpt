@@ -1477,9 +1477,9 @@ class GPT(nn.Module):
             cross_entropy = torch.logsumexp(logits_flat, dim=-1).unsqueeze(1) - target_logits
             for k in range(1, n_predict):  # zero out preds past end of sequence
                 cross_entropy[-k:, k] = 0
-            loss = (cross_entropy * mtp_weights).sum()
+            loss = (cross_entropy * mtp_weights).sum() / (target_seq.numel() * mtp_weights.sum())
         elif self.training:
-            loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="sum")
+            loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="mean")
         else:
             loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="mean")
         return loss
@@ -2013,6 +2013,8 @@ train_loader = distributed_data_generator(args.train_files, args.train_bs_schedu
 gc.collect()
 
 training_time_ms = 0
+# Track last computed train loss for validation logs.
+last_train_loss = None
 # start the clock
 torch.cuda.synchronize()
 t0 = time.perf_counter()
@@ -2040,7 +2042,13 @@ for step in range(train_steps + 1):
         val_loss /= val_steps
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        if last_train_loss is None:
+            train_loss_str = "train_loss:na"
+        else:
+            train_loss_str = f"train_loss:{last_train_loss:.4f}"
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} {train_loss_str} "
+               f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms",
+               console=True)
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -2055,18 +2063,26 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
+    train_loss = 0.0
     for idx in range(grad_accum_steps):
         # enable gradient sync for the DistAdam optimizers on the last iteration before we step them
         if idx == grad_accum_steps - 1:
             training_manager.activate_hooks(step)
         send_args = training_manager.train_loader_send_args
         inputs, targets, cum_seqlens = train_loader.send(send_args)
-        (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / grad_accum_steps).backward()
+        loss = model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
+        (loss / grad_accum_steps).backward()
+        train_loss += loss.detach()
     training_manager.step_optimizers(step)
 
     # logging
+    train_loss = train_loss / grad_accum_steps
+    dist.reduce(train_loss, 0, op=dist.ReduceOp.AVG)
+    last_train_loss = train_loss
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    print0(f"step:{step+1}/{train_steps} train_loss:{train_loss:.4f} "
+           f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms",
+           console=True)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
