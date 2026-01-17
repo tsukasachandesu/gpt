@@ -1557,7 +1557,7 @@ def _load_data_shard(file: Path):
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
     return tokens
 
-BOS_ID = 50256
+BOS_ID = 161
 
 class BOSFinder:
     # Helper for getting sequences that start at the beginning of documents by @varunneal based on work by @classiclarryd
@@ -1941,10 +1941,10 @@ class Hyperparameters:
     val_files: str = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
-    train_bs_schedule: tuple = (8 * 2048 * 8, 16 * 2048 * 8, 24 * 2048 * 8)
-    train_bs_extension: int = 24 * 2048 * 8
+    train_bs_schedule: tuple = (2048 * 8, 2 * 2048 * 8, 3 * 2048 * 8)
+    train_bs_extension: int = 24 * 2048 
     train_max_seq_len: int = 128 * 16
-    val_batch_size: int = 4 * 64 * 1024 * 8
+    val_batch_size: int = 4 * 64 * 1024 
     # optimization
     num_scheduled_iterations: int = 1735  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
@@ -2008,7 +2008,7 @@ print0(nvidia_smi())
 print0("="*100)
 
 model: nn.Module = GPT(
-    vocab_size=50257,
+    vocab_size=164,
     num_layers=11,
     num_heads=6,
     head_dim=128,
