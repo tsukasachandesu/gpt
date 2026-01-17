@@ -1951,7 +1951,7 @@ print0(nvidia_smi())
 print0("="*100)
 
 model: nn.Module = GPT(
-    vocab_size=50257,
+    vocab_size=164,
     num_layers=11,
     num_heads=6,
     head_dim=128,
