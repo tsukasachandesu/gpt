@@ -1597,7 +1597,7 @@ def _load_data_shard(file: Path):
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
     return tokens
 
-BOS_ID = 50256
+BOS_ID = 161
 
 class BOSFinder:
     # Helper for getting sequences that start at the beginning of documents by @varunneal based on work by @classiclarryd
