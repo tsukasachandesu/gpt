@@ -9,6 +9,7 @@ import math
 import threading
 import time
 import uuid
+import warnings
 from dataclasses import dataclass
 from collections import defaultdict
 from itertools import accumulate
@@ -36,6 +37,12 @@ dynamo.config.recompile_limit = 64
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
+
+def supports_fp8(device: torch.device) -> bool:
+    if not torch.cuda.is_available():
+        return False
+    major, _minor = torch.cuda.get_device_capability(device)
+    return major >= 9
 
 @torch.library.custom_op("nanogpt::mm", mutates_args=())
 def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
@@ -1430,7 +1437,14 @@ class GPT(nn.Module):
         self.yarn_paired_head = YarnPairedHead(head_dim, max_seq_len)
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
-        use_fp8 = not os.environ.get("DISABLE_FP8", False)
+        use_fp8_env = not os.environ.get("DISABLE_FP8", False)
+        device = torch.device(f"cuda:{os.environ.get('LOCAL_RANK', 0)}")
+        use_fp8 = use_fp8_env and supports_fp8(device)
+        if use_fp8_env and not use_fp8:
+            warnings.warn(
+                "FP8 kernels are not supported on this GPU; disabling FP8. "
+                "Set DISABLE_FP8=1 to silence this warning."
+            )
 
         self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=use_fp8, x_s=100/448, w_s=1.6/448, grad_s=0.75/448)
         nn.init.normal_(self.lm_head.weight, mean=0, std=0.005)
