@@ -1324,12 +1324,10 @@ class MLP(nn.Module):
             self.c_proj.zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x: Tensor):
-        # relu(x)^2:
-        # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-
-        # This call computes relu(x @ W1.T)^2 @ W2.T
-        return FusedLinearReLUSquareFunction.apply(x, self.c_fc, self.c_proj)
-
+        x = F.linear(x, self.c_fc.type_as(x))
+        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+        x = F.linear(x, self.c_proj.T.type_as(x))
+        return x
 
 class Block(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int, use_paired_head: bool):
@@ -1937,8 +1935,8 @@ class TrainingManager():
 @dataclass
 class Hyperparameters:
     # data
-    train_files: str = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
-    val_files: str = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
+    train_files: str = "train.bin" # input .bin to train on
+    val_files: str = "val.bin" # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
     train_bs_schedule: tuple = (2048 * 8, 2 * 2048 * 8, 3 * 2048 * 8)
