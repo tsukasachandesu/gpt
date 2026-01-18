@@ -32,7 +32,116 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention
 from torch import Tensor, nn
 
 dynamo.config.recompile_limit = 64
-#dynamo.config.recompile_limit = 4
+
+# -----------------------------------------------------------------------------
+# FlexAttention helpers
+#
+# We create BlockMask objects directly to avoid the overhead of create_block_mask
+# and to keep torch.compile stable. We also keep mask_mod callables stable (no
+# per-step Python function recreation) to avoid recompilations.
+
+def _dense_to_ordered(dense_mask: Tensor) -> tuple[Tensor, Tensor]:
+    """Convert a dense (rows x cols) boolean block mask into FlexAttention's
+    ordered representation.
+
+    Returns:
+        kv_num_blocks: int32 tensor of shape (rows,)
+        kv_indices: int32 tensor of shape (rows, cols)
+    """
+    dense_mask_i32 = dense_mask.to(dtype=torch.int32)
+    kv_num_blocks = dense_mask_i32.sum(dim=-1)
+    # True blocks first (descending), and stable to preserve column order.
+    kv_indices = torch.argsort(dense_mask_i32, dim=-1, descending=True, stable=True)
+    return kv_num_blocks.to(torch.int32).contiguous(), kv_indices.to(torch.int32).contiguous()
+
+
+class DocCausalSlidingWindowMask(nn.Module):
+    """mask_mod for packed-document causal sliding-window attention.
+
+    The mask depends on per-token document ids and a scalar window size.
+    Both are stored as buffers and updated each forward pass.
+    """
+
+    def __init__(self, max_seq_len: int):
+        super().__init__()
+        self.max_seq_len = int(max_seq_len)
+        self.doc_ids = nn.Buffer(torch.empty(self.max_seq_len, dtype=torch.int32), persistent=False)
+        # window is the FlashAttention-style *left* window in tokens (inclusive):
+        # allow kv where q_idx - kv_idx <= window
+        self.window = nn.Buffer(torch.zeros((), dtype=torch.int32), persistent=False)
+
+    def set_doc_ids(self, doc_ids: Tensor) -> None:
+        assert doc_ids.ndim == 1
+        assert doc_ids.numel() <= self.max_seq_len
+        self.doc_ids[: doc_ids.numel()].copy_(doc_ids.to(torch.int32))
+
+    def set_window(self, window_tokens: int) -> None:
+        self.window.fill_(int(window_tokens))
+
+    def forward(self, b, h, q_idx, kv_idx):
+        causal = q_idx >= kv_idx
+        same_doc = self.doc_ids[q_idx] == self.doc_ids[kv_idx]
+        within_window = (q_idx - kv_idx) <= self.window
+        return causal & same_doc & within_window
+
+
+def _build_doc_causal_window_blockmask(
+    doc_ids: Tensor,
+    *,
+    window_blocks: int,
+    block_size: int,
+    mask_mod: nn.Module,
+) -> BlockMask:
+    """Build a BlockMask for document-aware causal sliding-window attention.
+
+    Args:
+        doc_ids: int tensor of shape (T,) giving document ids per token.
+        window_blocks: window size in *blocks* (window_tokens = window_blocks * block_size).
+        block_size: block granularity used by FlexAttention (typically 128).
+        mask_mod: callable used for partial blocks.
+    """
+    assert doc_ids.ndim == 1
+    T = doc_ids.numel()
+    assert T % block_size == 0
+    n_blocks = T // block_size
+
+    # Document range per block (doc ids are non-decreasing).
+    docs_2d = doc_ids.view(n_blocks, block_size)
+    docs_low = docs_2d[:, 0]
+    docs_high = docs_2d[:, -1]
+
+    # Overlap / full-document block relations.
+    document_blockmask_any = (docs_low[:, None] <= docs_high[None, :]) & (docs_high[:, None] >= docs_low[None, :])
+    document_blockmask_all = (docs_low[:, None] == docs_high[None, :]) & (docs_high[:, None] == docs_low[None, :])
+
+    block_idx = torch.arange(n_blocks, device=doc_ids.device)
+    # d = q_block - kv_block
+    d = block_idx[:, None] - block_idx[None, :]
+
+    # Causal: allow kv blocks at/before q block.
+    causal_any = d >= 0
+    causal_all = d > 0  # exclude diagonal, which needs triangular masking
+
+    # Sliding window (FlashAttention semantics): allow kv within `window_blocks` blocks behind.
+    # d == window_blocks is a *partial* block boundary; d <= window_blocks - 1 can be fully unmasked.
+    w = int(window_blocks)
+    window_any = d <= w
+    window_all = d <= (w - 1)
+
+    blockmask_any = causal_any & window_any & document_blockmask_any
+    blockmask_all = causal_all & window_all & document_blockmask_all
+
+    partial_kv_num_blocks, partial_kv_indices = _dense_to_ordered(blockmask_any & ~blockmask_all)
+    full_kv_num_blocks, full_kv_indices = _dense_to_ordered(blockmask_all)
+
+    return BlockMask.from_kv_blocks(
+        partial_kv_num_blocks[None, None],
+        partial_kv_indices[None, None],
+        full_kv_num_blocks[None, None],
+        full_kv_indices[None, None],
+        BLOCK_SIZE=block_size,
+        mask_mod=mask_mod,
+    )
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
@@ -424,7 +533,9 @@ def polar_express(G: torch.Tensor, split_baddbmm: bool = False):
 # -----------------------------------------------------------------------------
 # Compiled helpers for NorMuon by @chrisjmccormick
 
-@torch.compile(dynamic=False, fullgraph=True)
+#@torch.compile(dynamic=False, fullgraph=True)
+@torch.compile(dynamic=True, fullgraph=True)
+
 def cautious_wd_and_update_inplace(p, mantissa, grad, wd_tensor, lr_tensor):
     """
     Cautious weight decay + parameter update. wd_tensor and lr_tensor are 0-D CPU tensors.
@@ -443,8 +554,7 @@ def cautious_wd_and_update_inplace(p, mantissa, grad, wd_tensor, lr_tensor):
     p.copy_((p_precise_raw >> 16).to(torch.uint16))
     mantissa.copy_(p_precise_raw.to(torch.uint16))
 
-#@torch.compile(dynamic=False, fullgraph=True)
-@torch.compile(dynamic=True, fullgraph=True)
+@torch.compile(dynamic=False, fullgraph=True)
 def apply_normuon_variance_reduction(v_chunk, second_momentum_buffer, beta2, red_dim):
     """NorMuon variance reduction. Algebraically fuses the normalization steps to minimize memory ops."""
     v_mean = v_chunk.float().square().mean(dim=red_dim, keepdim=True)
@@ -1308,65 +1418,61 @@ class GPT(nn.Module):
         self.split_embed = False
 
 
+        # FlexAttention mask_mod modules (kept stable for torch.compile)
+        self._mask_mod_long = DocCausalSlidingWindowMask(max_seq_len)
+        self._mask_mod_short = DocCausalSlidingWindowMask(max_seq_len)
+        self._mask_mod_long_paired = DocCausalSlidingWindowMask(2 * max_seq_len)
+        self._mask_mod_short_paired = DocCausalSlidingWindowMask(2 * max_seq_len)
 
     def create_blockmasks(self, input_seq: Tensor, ws_long: int, ws_short: int, *, paired: bool = False):
         """Create FlexAttention BlockMasks for (long, short) sliding-window attention.
 
-        This is adapted from the older flex-attention version (1.py):
-        - Document boundaries are inferred from BOS tokens (50256)
-        - Within each document we apply causal + sliding-window attention
-        - We split the mask into "full" blocks (no mask_mod needed) and "partial" blocks
+        Faithful replacement for FlashAttention varlen + window_size=(bm_size, 0):
+        - Packed documents are delineated by BOS tokens.
+        - Causal mask within each document.
+        - Sliding window with FlashAttention semantics: allow kv where q_idx - kv_idx <= bm_size.
+
+        We build two BlockMask objects (long/short) with:
+        - full blocks: no mask_mod needed
+        - partial blocks: mask_mod applies causal + document + window at token granularity
         """
-        BLOCK_SIZE = args.block_size  # typically 128
-        # doc ids: increment at each BOS. Works with packed documents.
-        docs = (input_seq == BOS_ID).cumsum(0)
+        BLOCK_SIZE = args.block_size  # FlexAttention block granularity (typically 128)
+
+        # doc ids: increment at each BOS. Works for both align_to_bos and non-aligned streams.
+        doc_ids = torch.cumsum(input_seq == BOS_ID, dim=0, dtype=torch.int32)
         if paired:
             # Paired-head attention interleaves tokens, doubling sequence length.
-            # Map interleaved positions back to original token indices via repeat_interleave(2).
-            docs = docs.repeat_interleave(2)
+            doc_ids = doc_ids.repeat_interleave(2)
 
-        def document_causal(b, h, q_idx, kv_idx):
-            causal_mask = q_idx >= kv_idx
-            document_mask = docs[q_idx] == docs[kv_idx]
-            return causal_mask & document_mask
+        # Select stable mask_mod modules.
+        if paired:
+            mask_long = self._mask_mod_long_paired
+            mask_short = self._mask_mod_short_paired
+        else:
+            mask_long = self._mask_mod_long
+            mask_short = self._mask_mod_short
 
-        def dense_to_ordered(dense_blockmask: Tensor):
-            num_blocks = dense_blockmask.sum(dim=-1, dtype=torch.int32)
-            indices = dense_blockmask.argsort(dim=-1, descending=False, stable=True).flip(-1).to(torch.int32)
-            return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
+        # Update buffers used by mask_mod.
+        mask_long.set_doc_ids(doc_ids)
+        mask_short.set_doc_ids(doc_ids)
+        mask_long.set_window(ws_long * BLOCK_SIZE)
+        mask_short.set_window(ws_short * BLOCK_SIZE)
 
-        # manual block mask creation (adapted from 1.py)
-        assert docs.numel() % BLOCK_SIZE == 0
-        num_blocks_total = docs.numel() // BLOCK_SIZE
-        block_idx = torch.arange(num_blocks_total, dtype=torch.int32, device=docs.device)
+        # Build BlockMasks (block-sparse structure + full-block optimization).
+        long_bm_mask = _build_doc_causal_window_blockmask(
+            doc_ids,
+            window_blocks=ws_long,
+            block_size=BLOCK_SIZE,
+            mask_mod=mask_long,
+        )
+        short_bm_mask = _build_doc_causal_window_blockmask(
+            doc_ids,
+            window_blocks=ws_short,
+            block_size=BLOCK_SIZE,
+            mask_mod=mask_short,
+        )
 
-        causal_blockmask_any = block_idx[:, None] >= block_idx
-        causal_blockmask_all = block_idx[:, None] > block_idx
-
-        docs_low = docs.view(-1, BLOCK_SIZE)[:, 0].contiguous()
-        docs_high = docs.view(-1, BLOCK_SIZE)[:, -1].contiguous()
-        document_blockmask_any = (docs_low[:, None] <= docs_high) & (docs_high[:, None] >= docs_low)
-        document_blockmask_all = (docs_low[:, None] == docs_high) & (docs_high[:, None] == docs_low)
-
-        blockmask_any = causal_blockmask_any & document_blockmask_any
-        blockmask_all = causal_blockmask_all & document_blockmask_all
-
-        partial_kv_num_blocks, partial_kv_indices = dense_to_ordered(blockmask_any & ~blockmask_all)
-        full_kv_num_blocks, full_kv_indices = dense_to_ordered(blockmask_all)
-
-        def build_bm(window_size_blocks: int) -> BlockMask:
-            # keep window size as int32 tensor on the same device
-            w = torch.tensor(window_size_blocks, dtype=torch.int32, device=docs.device)
-            return BlockMask.from_kv_blocks(
-                torch.clamp_max(partial_kv_num_blocks, torch.clamp_min(w - full_kv_num_blocks, 1)),
-                partial_kv_indices,
-                torch.clamp_max(full_kv_num_blocks, w - 1),
-                full_kv_indices,
-                BLOCK_SIZE=BLOCK_SIZE,
-                mask_mod=document_causal,
-            )
-
-        return build_bm(ws_long), build_bm(ws_short)
+        return long_bm_mask, short_bm_mask
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
 
