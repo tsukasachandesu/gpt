@@ -2080,10 +2080,7 @@ class Hyperparameters:
     val_files: str = "val.bin" # input .bin to eval validation loss on
     val_tokens: int = 32 * 2048  # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
-    train_bs_schedule: tuple = (16 * 2048, 16 * 2048,   16 * 2048, 32 * 2048 , 
-                                32 * 2048 , 32 * 2048 , 32 * 2048 , 32 * 2048 ,
-                                32 * 2048 , 32 * 2048 , 32 * 2048 , 32 * 2048 
-                               )
+    train_bs_schedule: tuple = (8 * 2048, 16 * 2048,32 * 2048)
     train_bs_extension: int = 32 * 2048 
     train_max_seq_len: int = 128 * 8 * 2 # doubled to enable longer window sizes
     val_batch_size: int = 32 * 2048 
@@ -2099,9 +2096,7 @@ class Hyperparameters:
     save_checkpoint: bool = False
     # attention masking
     block_size: int = 128
-    ws_schedule: tuple = (3, 7, 11, 13,
-                          15, 17, 19, 21,
-                          23, 23, 23, 23)
+    ws_schedule: tuple = (7, 17, 23)
     ws_final: int = 23 # set final validation ws, used for YaRN extension and short window size
     ws_validate_post_yarn_ext: int = 27 # extend long windows out even further after applying YaRN
 
@@ -2253,18 +2248,25 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
+    train_loss = torch.zeros((), device=device)
+    train_tokens = 0
     for idx in range(grad_accum_steps):
         # enable gradient sync for the DistAdam optimizers on the last iteration before we step them
         if idx == grad_accum_steps - 1:
             training_manager.activate_hooks(step)
         send_args = training_manager.train_loader_send_args
         inputs, targets, cum_seqlens = train_loader.send(send_args)
-        (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / grad_accum_steps).backward()
+        loss = model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
+        (loss / grad_accum_steps).backward()
+        train_loss += loss.detach()
+        train_tokens += targets.numel()
     training_manager.step_optimizers(step)
 
     # logging
+    train_loss_mean = train_loss / max(train_tokens, 1)
+    dist.reduce(train_loss_mean, 0, op=dist.ReduceOp.AVG)
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    print0(f"step:{step+1}/{train_steps} train_loss:{train_loss_mean:.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
