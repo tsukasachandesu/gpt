@@ -32,6 +32,7 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention
 from torch import Tensor, nn
 
 dynamo.config.recompile_limit = 64
+#dynamo.config.recompile_limit = 4
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
@@ -442,7 +443,8 @@ def cautious_wd_and_update_inplace(p, mantissa, grad, wd_tensor, lr_tensor):
     p.copy_((p_precise_raw >> 16).to(torch.uint16))
     mantissa.copy_(p_precise_raw.to(torch.uint16))
 
-@torch.compile(dynamic=False, fullgraph=True)
+#@torch.compile(dynamic=False, fullgraph=True)
+@torch.compile(dynamic=True, fullgraph=True)
 def apply_normuon_variance_reduction(v_chunk, second_momentum_buffer, beta2, red_dim):
     """NorMuon variance reduction. Algebraically fuses the normalization steps to minimize memory ops."""
     v_mean = v_chunk.float().square().mean(dim=red_dim, keepdim=True)
@@ -1882,12 +1884,12 @@ class Hyperparameters:
     # data
     train_files: str = "train.bin" # input .bin to train on
     val_files: str = "val.bin" # input .bin to eval validation loss on
-    val_tokens: int = 4 *  24 * 2048 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    val_tokens: int = 2 *  24 * 2048 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
-    train_bs_schedule: tuple = (2 * 8 * 2048 , 2 *  16 * 2048 ,2 *  24 * 2048)
-    train_bs_extension: int = 2 *  24 * 2048 
-    train_max_seq_len: int = 2 * 128 * 16
-    val_batch_size: int = 2 *  24 * 2048
+    train_bs_schedule: tuple = (8 * 2048 , 16 * 2048 ,24 * 2048)
+    train_bs_extension: int = 24 * 2048 
+    train_max_seq_len: int = 128 * 16
+    val_batch_size: int = 24 * 2048
     # optimization
     num_scheduled_iterations: int = 1735  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
