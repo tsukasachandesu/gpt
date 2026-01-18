@@ -2080,7 +2080,7 @@ class Hyperparameters:
     val_files: str = "val.bin" # input .bin to eval validation loss on
     val_tokens: int = 32 * 2048  # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
-    train_bs_schedule: tuple = (8 * 2048, 16 * 2048,32 * 2048)
+    train_bs_schedule: tuple = (8 * 2048,16 * 2048, 32 * 2048)
     train_bs_extension: int = 32 * 2048 
     train_max_seq_len: int = 128 * 8 * 2 # doubled to enable longer window sizes
     val_batch_size: int = 32 * 2048 
@@ -2160,7 +2160,7 @@ for m in model.modules():
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
-model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+model: nn.Module = torch.compile(model, dynamic=True, fullgraph=True)
 training_manager = TrainingManager(model)
 
 ########################################
