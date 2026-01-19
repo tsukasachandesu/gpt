@@ -1989,15 +1989,15 @@ class Hyperparameters:
     # data
     train_files: str = "train.bin" # input .bin to train on
     val_files: str = "val.bin" # input .bin to eval validation loss on
-    val_tokens: int = 2 *  24 * 2048 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    val_tokens: int = 64 * 2048 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
-    train_bs_schedule: tuple = (2 * 8 * 2048 , 2 *  16 * 2048 ,2 *  24 * 2048)
-    train_bs_extension: int = 2 *  24 * 2048 
+    train_bs_schedule: tuple = (16 * 2048 , 32 * 2048 ,64* 2048)
+    train_bs_extension: int = 64 * 2048 
     train_max_seq_len: int = 2 * 128 * 16
-    val_batch_size: int = 2 *  24 * 2048
+    val_batch_size: int = 64 * 2048
     # optimization
-    num_scheduled_iterations: int = 1735  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 400  # number of steps to continue training at final lr and ws
+    num_scheduled_iterations: int = 2000  # number of steps to complete lr and ws schedule
+    num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.50  # fraction of num_scheduled_iterations spent cooling down the learning rate
     split_embed_frac: float = 2/3  # fraction of training when embeddings split from lm_head
@@ -2073,7 +2073,7 @@ model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
-model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+model: nn.Module = torch.compile(model, dynamic=True, fullgraph=True)
 training_manager = TrainingManager(model)
 
 ########################################
