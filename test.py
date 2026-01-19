@@ -1801,14 +1801,14 @@ class Hyperparameters:
     # data
     train_files: str = "train.bin" # input .bin to train on
     val_files: str = "val.bin" # input .bin to eval validation loss on
-    val_tokens: int = 128 * 2048 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    val_tokens: int = 64 * 2048 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
-    train_bs_schedule: tuple = (2048 * 32, 64 * 2048, 128 * 2048)
-    train_bs_extension: int = 128 * 2048
-    train_max_seq_len: int = 128 * 16
-    val_batch_size: int = 128 * 2048
+    train_bs_schedule: tuple = (2048 * 16, 32 * 2048, 64 * 2048)
+    train_bs_extension: int = 64 * 2048
+    train_max_seq_len: int = 2 * 128 * 16
+    val_batch_size: int = 64 * 2048
     # optimization
-    num_scheduled_iterations: int = 3000  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 2000  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.50  # fraction of num_scheduled_iterations spent cooling down the learning rate
@@ -1932,6 +1932,7 @@ train_loader = distributed_data_generator(args.train_files, args.train_bs_schedu
 gc.collect()
 
 training_time_ms = 0
+last_train_loss = None
 # start the clock
 torch.cuda.synchronize()
 t0 = time.perf_counter()
@@ -1959,7 +1960,13 @@ for step in range(train_steps + 1):
         val_loss /= val_steps
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        if last_train_loss is None:
+            train_loss_str = "train_loss:na"
+        else:
+            train_loss_str = f"train_loss:{last_train_loss:.4f}"
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} {train_loss_str} "
+               f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms",
+               console=True)
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -1974,8 +1981,7 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
-    train_loss = torch.zeros((), device=device, dtype=torch.float32)
-    train_tokens = 0
+    train_loss = 0.0
     for idx in range(grad_accum_steps):
         # enable gradient sync for the DistAdam optimizers on the last iteration before we step them
         if idx == grad_accum_steps - 1:
@@ -1983,16 +1989,18 @@ for step in range(train_steps + 1):
         send_args = training_manager.train_loader_send_args
         inputs, targets, cum_seqlens = train_loader.send(send_args)
         loss = model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
-        train_loss += loss.detach()
-        train_tokens += targets.numel()
         (loss / grad_accum_steps).backward()
+        train_loss += loss.detach()
     training_manager.step_optimizers(step)
 
     # logging
-    train_loss_mean = train_loss / max(train_tokens, 1)
-    dist.reduce(train_loss_mean, 0, op=dist.ReduceOp.AVG)
+    train_loss = train_loss / grad_accum_steps
+    dist.reduce(train_loss, 0, op=dist.ReduceOp.AVG)
+    last_train_loss = train_loss
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_loss:{train_loss_mean:.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    print0(f"step:{step+1}/{train_steps} train_loss:{train_loss:.4f} "
+           f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms",
+           console=True)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
