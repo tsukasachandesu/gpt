@@ -1808,8 +1808,8 @@ class Hyperparameters:
     train_max_seq_len: int = 2 * 128 * 16
     val_batch_size: int = 64 * 2048
     # optimization
-    num_scheduled_iterations: int = 1500  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 1500  # number of steps to continue training at final lr and ws
+    num_scheduled_iterations: int = 2200  # number of steps to complete lr and ws schedule
+    num_extension_iterations: int = 800  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.50  # fraction of num_scheduled_iterations spent cooling down the learning rate
     split_embed_frac: float = 2/3  # fraction of training when embeddings split from lm_head
@@ -1982,7 +1982,8 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
-    train_loss = 0.0
+    train_loss = torch.zeros((), device=device, dtype=torch.float32)
+    train_tokens = 0
     for idx in range(grad_accum_steps):
         # enable gradient sync for the DistAdam optimizers on the last iteration before we step them
         if idx == grad_accum_steps - 1:
@@ -1992,14 +1993,15 @@ for step in range(train_steps + 1):
         loss = model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
         (loss / grad_accum_steps).backward()
         train_loss += loss.detach()
+        train_tokens += targets.numel()
     training_manager.step_optimizers(step)
 
     # logging
-    train_loss = train_loss / grad_accum_steps
-    dist.reduce(train_loss, 0, op=dist.ReduceOp.AVG)
-    last_train_loss = train_loss
+    train_loss_mean = train_loss / max(train_tokens, 1)
+    dist.reduce(train_loss_mean, 0, op=dist.ReduceOp.AVG)
+    last_train_loss = train_loss_mean
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_loss:{train_loss:.4f} "
+    print0(f"step:{step+1}/{train_steps} train_loss:{train_loss_mean:.4f} "
            f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms",
            console=True)
 
