@@ -1808,8 +1808,8 @@ class Hyperparameters:
     train_max_seq_len: int = 2 * 128 * 16
     val_batch_size: int = 64 * 2048
     # optimization
-    num_scheduled_iterations: int = 2200  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 800  # number of steps to continue training at final lr and ws
+    num_scheduled_iterations: int = 1700  # number of steps to complete lr and ws schedule
+    num_extension_iterations: int = 300  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.50  # fraction of num_scheduled_iterations spent cooling down the learning rate
     split_embed_frac: float = 2/3  # fraction of training when embeddings split from lm_head
@@ -1819,8 +1819,8 @@ class Hyperparameters:
     save_checkpoint: bool = False
     # attention masking
     block_size: int = 128
-    ws_schedule: tuple = (3, 7, 11)
-    ws_final: int = 13 # increase final validation ws, used for YaRN extension and short window size @classiclarryd
+    ws_schedule: tuple = (3, 7, 11, 15)
+    ws_final: int = 17 # increase final validation ws, used for YaRN extension and short window size @classiclarryd
     ws_validate_post_yarn_ext: int = 20 # extend long windows out even further after applying YaRN
 
 args = Hyperparameters()
