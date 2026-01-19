@@ -11,7 +11,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from collections import defaultdict
-from itertools import accumulate
+from itertools import accumulate, cycle
 from pathlib import Path
 import gc
 
@@ -1520,7 +1520,7 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {filename_pattern}")
 
-    file_iter = iter(files)  # Use itertools.cycle(files) for multi-epoch training
+    file_iter = cycle(files) if len(files) == 1 else iter(files)
     tokens = _load_data_shard(next(file_iter))
     if align_to_bos:
         finder = BOSFinder(tokens, world_size=world_size, quickload=True)
@@ -1800,14 +1800,14 @@ class TrainingManager():
 @dataclass
 class Hyperparameters:
     # data
-    train_files: str = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
-    val_files: str = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
-    val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    train_files: str = "train.bin" # input .bin to train on
+    val_files: str = "val.bin" # input .bin to eval validation loss on
+    val_tokens: int = 24 * 2048 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
-    train_bs_schedule: tuple = (8 * 2048 * 8, 16 * 2048 * 8, 24 * 2048 * 8)
-    train_bs_extension: int = 24 * 2048 * 8
+    train_bs_schedule: tuple = (2048 * 8, 16 * 2048, 24 * 2048)
+    train_bs_extension: int = 24 * 2048
     train_max_seq_len: int = 128 * 16
-    val_batch_size: int = 4 * 64 * 1024 * 8
+    val_batch_size: int = 24 * 2048
     # optimization
     num_scheduled_iterations: int = 1735  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
@@ -1871,7 +1871,7 @@ print0(nvidia_smi())
 print0("="*100)
 
 model: nn.Module = GPT(
-    vocab_size=50257,
+    vocab_size=164,
     num_layers=11,
     num_heads=6,
     head_dim=128,
