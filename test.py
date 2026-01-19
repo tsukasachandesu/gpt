@@ -1801,15 +1801,15 @@ class Hyperparameters:
     # data
     train_files: str = "train.bin" # input .bin to train on
     val_files: str = "val.bin" # input .bin to eval validation loss on
-    val_tokens: int = 24 * 2048 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    val_tokens: int = 32 * 2048 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
-    train_bs_schedule: tuple = (2048 * 8, 16 * 2048, 24 * 2048)
-    train_bs_extension: int = 24 * 2048
+    train_bs_schedule: tuple = (2048 * 8, 16 * 2048, 32 * 2048)
+    train_bs_extension: int = 32 * 2048
     train_max_seq_len: int = 128 * 16
-    val_batch_size: int = 24 * 2048
+    val_batch_size: int = 32 * 2048
     # optimization
-    num_scheduled_iterations: int = 1735  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
+    num_scheduled_iterations: int = 2000  # number of steps to complete lr and ws schedule
+    num_extension_iterations: int = 200  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.50  # fraction of num_scheduled_iterations spent cooling down the learning rate
     split_embed_frac: float = 2/3  # fraction of training when embeddings split from lm_head
@@ -1885,7 +1885,7 @@ model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
-model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+model: nn.Module = torch.compile(model, dynamic=True, fullgraph=True)
 training_manager = TrainingManager(model)
 
 ########################################
@@ -1974,18 +1974,23 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
+    train_loss = torch.zeros((), device=device, dtype=torch.float32)
     for idx in range(grad_accum_steps):
         # enable gradient sync for the DistAdam optimizers on the last iteration before we step them
         if idx == grad_accum_steps - 1:
             training_manager.activate_hooks(step)
         send_args = training_manager.train_loader_send_args
         inputs, targets, cum_seqlens = train_loader.send(send_args)
-        (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / grad_accum_steps).backward()
+        loss = model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
+        train_loss += loss.detach()
+        (loss / grad_accum_steps).backward()
+    train_loss /= grad_accum_steps
+    dist.reduce(train_loss, 0, op=dist.ReduceOp.AVG)
     training_manager.step_optimizers(step)
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    print0(f"step:{step+1}/{train_steps} train_loss:{train_loss:.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
