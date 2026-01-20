@@ -14,7 +14,6 @@ from collections import defaultdict
 from itertools import accumulate, cycle
 from pathlib import Path
 import gc
-from flash_attn import flash_attn_interface
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -919,7 +918,8 @@ class AttnArgs:
     sin: torch.Tensor
     attn_scale: float
     key_offset: bool
-    
+
+from flash_attn import flash_attn_interface
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
@@ -1231,7 +1231,7 @@ def _load_data_shard(file: Path):
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
     return tokens
 
-BOS_ID = 131
+BOS_ID = 161
 
 class BOSFinder:
     # Helper for getting sequences that start at the beginning of documents by @varunneal based on work by @classiclarryd
