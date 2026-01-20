@@ -1611,7 +1611,7 @@ class Hyperparameters:
     # data
     train_files: str = "train.bin" # input .bin to train on
     val_files: str = "val.bin" # input .bin to eval validation loss on
-    val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    val_tokens: int = 32 * 2048 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
     train_bs_schedule: tuple = (4 * 2048, 8 * 2048, 16 * 2048, 32 * 2048, 
                                 32 * 2048, 32 * 2048, 32 * 2048, 32 * 2048,
