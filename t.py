@@ -14,6 +14,7 @@ from collections import defaultdict
 from itertools import accumulate, cycle
 from pathlib import Path
 import gc
+from flash_attn import flash_attn_interface
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -918,8 +919,7 @@ class AttnArgs:
     sin: torch.Tensor
     attn_scale: float
     key_offset: bool
-
-flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+    
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
