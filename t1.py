@@ -1029,24 +1029,19 @@ class TrainingManager():
     def __init__(self, model):
         self.model = model
 
-        reference_batch_size = args.reference_batch_size
-        batch_ratio = args.total_batch_size_tokens / reference_batch_size
-        self.batch_lr_scale = batch_ratio ** 0.5 if batch_ratio != 1.0 else 1.0
-        if batch_ratio != 1.0:
-            print0(f"Scaling LRs by {self.batch_lr_scale:.4f} for batch size {args.total_batch_size_tokens:,} (reference: {reference_batch_size:,})")
-
+        self.reference_batch_size = args.reference_batch_size
         self.weight_decay_scaled = args.weight_decay * (12 / model.num_layers) ** 2
         if model.num_layers != 12:
             print0(f"Scaling weight decay from {args.weight_decay:.6f} to {self.weight_decay_scaled:.6f} for depth {model.num_layers}")
 
         adam_betas = (args.adam_beta1, args.adam_beta2)
         self.optimizers = model.setup_optimizers(
-            unembedding_lr=args.unembedding_lr * self.batch_lr_scale,
-            embedding_lr=args.embedding_lr * self.batch_lr_scale,
-            matrix_lr=args.matrix_lr * self.batch_lr_scale,
+            unembedding_lr=args.unembedding_lr,
+            embedding_lr=args.embedding_lr,
+            matrix_lr=args.matrix_lr,
             weight_decay=self.weight_decay_scaled,
             adam_betas=adam_betas,
-            scalar_lr=args.scalar_lr * self.batch_lr_scale,
+            scalar_lr=args.scalar_lr,
         )
         self.adamw_opt, self.muon_opt = self.optimizers
 
@@ -1079,12 +1074,18 @@ class TrainingManager():
 
         new_batch_size = get_bs(step)
         if new_batch_size != self.batch_size:
+            batch_ratio = new_batch_size / self.reference_batch_size
+            self.batch_lr_scale = batch_ratio ** 0.5 if batch_ratio != 1.0 else 1.0
+            print0(
+                f"Scaling LRs by {self.batch_lr_scale:.4f} for batch size {new_batch_size:,} "
+                f"(reference: {self.reference_batch_size:,})"
+            )
             self.train_loader_send_args = (new_batch_size, args.train_max_seq_len, grad_accum_steps)
         else:
             self.train_loader_send_args = None
 
         self.ws_long = new_ws_long
-    
+
     def step_optimizers(self, step: int):
         step_lr = get_lr(step)
         muon_momentum = get_muon_momentum(step)
@@ -1095,7 +1096,7 @@ class TrainingManager():
 
         for opt in self.optimizers:
             for group in opt.param_groups:
-                group["lr"] = group["initial_lr"] * step_lr
+                group["lr"] = group["initial_lr"] * self.batch_lr_scale * step_lr
             opt.step()
         self.model.zero_grad(set_to_none=True)
 
@@ -1109,6 +1110,8 @@ class TrainingManager():
 
         self.ws_short, self.ws_long = get_ws(0)
         self.batch_size = get_bs(0)
+        batch_ratio = self.batch_size / self.reference_batch_size
+        self.batch_lr_scale = batch_ratio ** 0.5 if batch_ratio != 1.0 else 1.0
         self.model.yarn.reset()
 
     def get_state(self):
@@ -1135,7 +1138,7 @@ class Hyperparameters:
     reference_batch_size: int = 2**19
     # optimization
     unembedding_lr: float = 0.004
-    embedding_lr: float = 0.2
+    embedding_lr: float = 0.3
     matrix_lr: float = 0.02
     scalar_lr: float = 0.5
     weight_decay: float = 0.2
@@ -1237,38 +1240,6 @@ for param in model.parameters():
 #model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 model: nn.Module = model
 training_manager = TrainingManager(model)
-
-########################################
-#            Warmup kernels            #
-########################################
-print0("Compiling model and warming up kernels (~7 minutes on first execution)", console=True)
-# Warmup the training kernels, then re-initialize the state so we aren't cheating
-initial_state = dict(model=copy.deepcopy(model.state_dict()),
-                     optimizers=training_manager.get_state()) # save the initial state
-train_loader = distributed_data_generator(args.train_files, args.train_bs_schedule[0], args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
-val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
-
-transition_steps = training_manager.get_transition_steps()
-warmup_steps = sorted(set(s + offset for s in transition_steps for offset in [-1, 0, 1] if s + offset >= 0))
-print0(f"Sampling steps {warmup_steps} for warmup", console=True)
-for step in warmup_steps:
-    training_manager.advance_schedule(step)
-    model.eval()
-    with torch.no_grad():
-        inputs, targets, cum_seqlens = next(val_loader)
-        model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
-    model.train()
-    for idx in range(grad_accum_steps):
-        send_args = training_manager.train_loader_send_args
-        inputs, targets, cum_seqlens = train_loader.send(send_args)
-        (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / grad_accum_steps).backward()
-    training_manager.step_optimizers(step)
-print0("Resetting Model", console=True)
-model.zero_grad(set_to_none=True)
-model.load_state_dict(initial_state["model"])
-training_manager.reset(initial_state["optimizers"])
-del val_loader, train_loader, initial_state
-model.train()
 
 ########################################
 #        Training and validation       #
