@@ -570,7 +570,7 @@ class CausalSelfAttention(nn.Module):
         k = apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
+        max_len = args.train_max_seq_len if self.training else args.device_batch_size_tokens
         y = flash_attn_interface.flash_attn_varlen_func(
             q[0], k[0], v[0],
             cu_seqlens_q=attn_args.seqlens, cu_seqlens_k=attn_args.seqlens,
@@ -1074,13 +1074,16 @@ class TrainingManager():
 
         new_batch_size = get_bs(step)
         if new_batch_size != self.batch_size:
+            new_grad_accum_steps = compute_grad_accum_steps(new_batch_size)
             batch_ratio = new_batch_size / self.reference_batch_size
             self.batch_lr_scale = batch_ratio ** 0.5 if batch_ratio != 1.0 else 1.0
             print0(
                 f"Scaling LRs by {self.batch_lr_scale:.4f} for batch size {new_batch_size:,} "
                 f"(reference: {self.reference_batch_size:,})"
             )
-            self.train_loader_send_args = (new_batch_size, args.train_max_seq_len, grad_accum_steps)
+            self.train_loader_send_args = (new_batch_size, args.train_max_seq_len, new_grad_accum_steps)
+            self.grad_accum_steps = new_grad_accum_steps
+            self.batch_size = new_batch_size
         else:
             self.train_loader_send_args = None
 
@@ -1110,6 +1113,7 @@ class TrainingManager():
 
         self.ws_short, self.ws_long = get_ws(0)
         self.batch_size = get_bs(0)
+        self.grad_accum_steps = compute_grad_accum_steps(self.batch_size)
         batch_ratio = self.batch_size / self.reference_batch_size
         self.batch_lr_scale = batch_ratio ** 0.5 if batch_ratio != 1.0 else 1.0
         self.model.yarn.reset()
@@ -1178,8 +1182,24 @@ rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
 tokens_per_fwdbwd = args.device_batch_size_tokens
 world_tokens_per_fwdbwd = tokens_per_fwdbwd * world_size
-assert args.total_batch_size_tokens % world_tokens_per_fwdbwd == 0, "Total batch size must be divisible by device batch tokens * world size"
-grad_accum_steps = args.total_batch_size_tokens // world_tokens_per_fwdbwd
+
+def compute_grad_accum_steps(total_tokens: int) -> int:
+    assert total_tokens % world_tokens_per_fwdbwd == 0, (
+        "Total batch size must be divisible by device batch tokens * world size"
+    )
+    return total_tokens // world_tokens_per_fwdbwd
+
+grad_accum_steps = compute_grad_accum_steps(args.total_batch_size_tokens)
+val_grad_accum_steps = compute_grad_accum_steps(args.val_batch_size)
+assert args.device_batch_size_tokens <= args.train_max_seq_len, "device_batch_size_tokens must be <= train_max_seq_len"
+
+# Validate batch sizes for all scheduled steps up-front
+_all_train_bs = list(args.train_bs_schedule) + [args.train_bs_extension]
+for bs in _all_train_bs + [args.val_batch_size]:
+    assert bs % world_tokens_per_fwdbwd == 0, (
+        f"Batch size {bs} must be divisible by device_batch_size_tokens * world_size "
+        f"({world_tokens_per_fwdbwd})"
+    )
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
@@ -1228,7 +1248,7 @@ model: nn.Module = GPT(
     num_kv_heads=(args.num_kv_heads or num_heads),
     head_dim=head_dim,
     model_dim=model_dim,
-    max_seq_len=args.val_batch_size // (grad_accum_steps * world_size)
+    max_seq_len=args.train_max_seq_len
 ).cuda()
 if model.transformer.wte.weight.device.type == "cuda":
     model.transformer.wte.to(dtype=torch.bfloat16)
@@ -1266,8 +1286,8 @@ for step in range(train_steps + 1):
         training_time_ms += 1000 * (time.perf_counter() - t0)
         model.eval()
         assert args.val_tokens % args.val_batch_size == 0
-        val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
-        val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
+        val_steps = val_grad_accum_steps * args.val_tokens // args.val_batch_size
+        val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=val_grad_accum_steps, align_to_bos=False)
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
@@ -1291,10 +1311,10 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
-    for idx in range(grad_accum_steps):
+    for idx in range(training_manager.grad_accum_steps):
         send_args = training_manager.train_loader_send_args
         inputs, targets, cum_seqlens = train_loader.send(send_args)
-        (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / grad_accum_steps).backward()
+        (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / training_manager.grad_accum_steps).backward()
     training_manager.step_optimizers(step)
 
     # logging
