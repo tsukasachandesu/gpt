@@ -986,7 +986,7 @@ def get_ws(step: int):
     x = step / args.num_scheduled_iterations
     assert 0 <= x < 1
     ws_idx = int(len(args.ws_schedule) * x)
-    return min(11,args.ws_schedule[ws_idx] // 2), args.ws_schedule[ws_idx]
+    return args.ws_schedule[ws_idx] // 2, args.ws_schedule[ws_idx]
 
 # learning rate schedule: nanochat warmup/warmdown
 def get_lr(step: int):
@@ -1048,7 +1048,11 @@ class TrainingManager():
         self.reset()
 
     def apply_final_ws_ext(self):
-        self.ws_long = args.ws_validate_post_yarn_ext
+        new_ws_long = args.ws_validate_post_yarn_ext
+        if new_ws_long != self.ws_long:
+            self.model.yarn.apply(self.ws_long, new_ws_long)
+            self.ws_long = new_ws_long
+        self.ws_short = self.ws_long // 2
 
     def get_forward_args(self):
         return ForwardScheduleConfig(
@@ -1068,8 +1072,7 @@ class TrainingManager():
 
     def advance_schedule(self, step: int):
         self.ws_short, new_ws_long = get_ws(step)
-        # only apply yarn for first few
-        if new_ws_long != self.ws_long and new_ws_long<=13:
+        if new_ws_long != self.ws_long:
             self.model.yarn.apply(self.ws_long, new_ws_long)
 
         new_batch_size = get_bs(step)
@@ -1138,7 +1141,7 @@ class Hyperparameters:
     train_bs_extension: int = 32 * 2048
     train_max_seq_len: int = 128 * 16 * 2 # doubled to enable longer window sizes
     val_batch_size: int = 32 * 2048
-    device_batch_size_tokens: int = 1024  # tokens per micro-batch per rank (varlen)
+    device_batch_size_tokens: int = train_max_seq_len  # per-rank sequence length (varlen B==1)
     reference_batch_size: int = 2**19
     # optimization
     unembedding_lr: float = 0.004
@@ -1192,6 +1195,15 @@ def compute_grad_accum_steps(total_tokens: int) -> int:
 grad_accum_steps = compute_grad_accum_steps(args.total_batch_size_tokens)
 val_grad_accum_steps = compute_grad_accum_steps(args.val_batch_size)
 assert args.device_batch_size_tokens <= args.train_max_seq_len, "device_batch_size_tokens must be <= train_max_seq_len"
+assert args.device_batch_size_tokens % 16 == 0, (
+    "device_batch_size_tokens must be a multiple of 16 (flash_attn varlen requirement)"
+)
+max_ws = max(args.ws_schedule + (args.ws_final, args.ws_validate_post_yarn_ext))
+max_window_tokens = max_ws * args.block_size
+assert args.device_batch_size_tokens >= max_window_tokens, (
+    f"device_batch_size_tokens ({args.device_batch_size_tokens}) must cover max window "
+    f"{max_ws} * block_size {args.block_size} = {max_window_tokens}"
+)
 
 # Validate batch sizes for all scheduled steps up-front
 _all_train_bs = list(args.train_bs_schedule) + [args.train_bs_extension]
@@ -1236,6 +1248,8 @@ print0("="*100)
 print0(f"Tokens / micro-batch / rank: {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {args.total_batch_size_tokens:,} => gradient accumulation steps: {grad_accum_steps}")
+
+autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 
 num_layers = 16
 num_heads = 8
@@ -1285,14 +1299,22 @@ for step in range(train_steps + 1):
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
         model.eval()
-        assert args.val_tokens % args.val_batch_size == 0
-        val_steps = val_grad_accum_steps * args.val_tokens // args.val_batch_size
+        val_batches = math.ceil(args.val_tokens / args.val_batch_size)
+        val_tokens_effective = val_batches * args.val_batch_size
+        if val_tokens_effective != args.val_tokens:
+            print0(
+                f"val_tokens rounded up from {args.val_tokens:,} to {val_tokens_effective:,} "
+                f"to fit val_batch_size {args.val_batch_size:,}",
+                console=True,
+            )
+        val_steps = val_batches * val_grad_accum_steps
         val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=val_grad_accum_steps, align_to_bos=False)
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets, cum_seqlens = next(val_loader)
-                val_loss += model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
+                with autocast_ctx:
+                    val_loss += model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
         val_loss /= val_steps
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
@@ -1314,7 +1336,8 @@ for step in range(train_steps + 1):
     for idx in range(training_manager.grad_accum_steps):
         send_args = training_manager.train_loader_send_args
         inputs, targets, cum_seqlens = train_loader.send(send_args)
-        (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / training_manager.grad_accum_steps).backward()
+        with autocast_ctx:
+            (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / training_manager.grad_accum_steps).backward()
     training_manager.step_optimizers(step)
 
     # logging
