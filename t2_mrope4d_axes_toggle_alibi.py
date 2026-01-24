@@ -556,6 +556,11 @@ class Yarn(nn.Module):
         enable_bar: bool = True,
         enable_pos: bool = True,
         enable_pitch: bool = True,
+        # 軸を ALiBi に移譲する場合（該当軸の RoPE は identity にする）
+        alibi_index: bool = False,
+        alibi_bar: bool = False,
+        alibi_pos: bool = False,
+        alibi_pitch: bool = False,
     ):
         super().__init__()
         if head_dim % 2 != 0:
@@ -595,6 +600,12 @@ class Yarn(nn.Module):
         self.enable_bar = bool(enable_bar)
         self.enable_pos = bool(enable_pos)
         self.enable_pitch = bool(enable_pitch)
+
+        # axes routed to ALiBi (RoPE identity for the corresponding rotary pairs)
+        self.alibi_index = bool(alibi_index)
+        self.alibi_bar = bool(alibi_bar)
+        self.alibi_pos = bool(alibi_pos)
+        self.alibi_pitch = bool(alibi_pitch)
 
         # split head_dim/2 pairs across 4 axes
         total_pairs = self.head_dim // 2
@@ -738,24 +749,73 @@ class Yarn(nn.Module):
             raise ValueError(f"sequence length {T} exceeds rotary cache length {self.max_seq_len}")
 
         # Which axes do we actually apply?
-        use_bar = self.enable_bar and (self.pairs_bar > 0)
-        use_pos = self.enable_pos and (self.pairs_pos > 0)
-        use_pitch = self.enable_pitch and (self.pairs_pitch > 0)
+        # - enable_* : RoPE を適用するか（上書きするか）
+        # - alibi_*  : その軸を ALiBi に移譲するか（該当ペアは identity 回転）
+        use_bar = self.enable_bar and (self.pairs_bar > 0) and (not self.alibi_bar)
+        use_pos = self.enable_pos and (self.pairs_pos > 0) and (not self.alibi_pos)
+        use_pitch = self.enable_pitch and (self.pairs_pitch > 0) and (not self.alibi_pitch)
         need_extra = use_bar or use_pos or use_pitch
+
+        # identity が必要な軸（ALiBi に移譲して RoPE を無効化するペア）
+        need_identity_bar = self.alibi_bar and (self.pairs_bar > 0)
+        need_identity_pos = self.alibi_pos and (self.pairs_pos > 0)
+        need_identity_pitch = self.alibi_pitch and (self.pairs_pitch > 0)
+        need_identity = need_identity_bar or need_identity_pos or need_identity_pitch
 
         # Always slice the base cache (cheap view); used as base or identity source
         cos_index = self._cos_index[:T]
         sin_index = self._sin_index[:T]
 
-        # Fast path: pure index (or pure identity) RoPE
-        if not need_extra:
-            if self.enable_index:
+        # Fast path: no extra overwrite and no identity-masking
+        if (not need_extra) and (not need_identity):
+            if self.enable_index and (not self.alibi_index):
                 cos = cos_index
                 sin = sin_index
             else:
                 # position=0 (cos=1, sin=0) expanded => identity rotation
                 cos = cos_index[:1].expand(T, -1)
                 sin = sin_index[:1].expand(T, -1)
+            return cos[None, :, None, :], sin[None, :, None, :]
+
+        # Identity-only path: no extra overwrite, but some axes must be identity (routed to ALiBi)
+        if (not need_extra) and need_identity:
+            if self.enable_index and (not self.alibi_index):
+                cos = cos_index.clone()
+                sin = sin_index.clone()
+            else:
+                cos = cos_index[:1].expand(T, -1).clone()
+                sin = sin_index[:1].expand(T, -1).clone()
+
+            # Set routed axes to identity (cos=1, sin=0) for their allocated rotary pairs.
+            if self.pair_layout == 'block':
+                s0, s1, s2, s3 = self.mrope_section
+                o1 = s0
+                o2 = s0 + s1
+                o3 = s0 + s1 + s2
+                if need_identity_bar and s1 > 0:
+                    cos[:, o1:o2] = 1.0
+                    sin[:, o1:o2] = 0.0
+                if need_identity_pos and s2 > 0:
+                    cos[:, o2:o3] = 1.0
+                    sin[:, o2:o3] = 0.0
+                if need_identity_pitch and s3 > 0:
+                    cos[:, o3:] = 1.0
+                    sin[:, o3:] = 0.0
+            else:
+                stride = 4
+                if need_identity_bar and self.pairs_bar > 0:
+                    end = int(self.pairs_bar) * stride
+                    cos[:, 1:end:stride] = 1.0
+                    sin[:, 1:end:stride] = 0.0
+                if need_identity_pos and self.pairs_pos > 0:
+                    end = int(self.pairs_pos) * stride
+                    cos[:, 2:end:stride] = 1.0
+                    sin[:, 2:end:stride] = 0.0
+                if need_identity_pitch and self.pairs_pitch > 0:
+                    end = int(self.pairs_pitch) * stride
+                    cos[:, 3:end:stride] = 1.0
+                    sin[:, 3:end:stride] = 0.0
+
             return cos[None, :, None, :], sin[None, :, None, :]
 
         tok = token_ids.to(torch.int32) if token_ids.dtype != torch.int32 else token_ids
@@ -835,7 +895,8 @@ class Yarn(nn.Module):
             sin_pitch = F.embedding(pitch_idx, self._sin_pitch)
 
         # base: index RoPE or identity
-        if self.enable_index:
+        # - alibi_index=True の場合、index の RoPE は無効化し、base は identity にする
+        if self.enable_index and (not self.alibi_index):
             cos_base = cos_index
             sin_base = sin_index
         else:
@@ -876,6 +937,37 @@ class Yarn(nn.Module):
                 cos[:, 3:end:stride] = cos_pitch[:, 3:end:stride]
                 sin[:, 3:end:stride] = sin_pitch[:, 3:end:stride]
 
+        # If some axes are routed to ALiBi, force their allocated rotary pairs to identity.
+        if need_identity:
+            if self.pair_layout == 'block':
+                s0, s1, s2, s3 = self.mrope_section
+                o1 = s0
+                o2 = s0 + s1
+                o3 = s0 + s1 + s2
+                if need_identity_bar and s1 > 0:
+                    cos[:, o1:o2] = 1.0
+                    sin[:, o1:o2] = 0.0
+                if need_identity_pos and s2 > 0:
+                    cos[:, o2:o3] = 1.0
+                    sin[:, o2:o3] = 0.0
+                if need_identity_pitch and s3 > 0:
+                    cos[:, o3:] = 1.0
+                    sin[:, o3:] = 0.0
+            else:
+                stride = 4
+                if need_identity_bar and self.pairs_bar > 0:
+                    end = int(self.pairs_bar) * stride
+                    cos[:, 1:end:stride] = 1.0
+                    sin[:, 1:end:stride] = 0.0
+                if need_identity_pos and self.pairs_pos > 0:
+                    end = int(self.pairs_pos) * stride
+                    cos[:, 2:end:stride] = 1.0
+                    sin[:, 2:end:stride] = 0.0
+                if need_identity_pitch and self.pairs_pitch > 0:
+                    end = int(self.pairs_pitch) * stride
+                    cos[:, 3:end:stride] = 1.0
+                    sin[:, 3:end:stride] = 0.0
+
         # shape to [1, T, 1, D/2] for apply_rotary_emb()
         return cos[None, :, None, :], sin[None, :, None, :]
 
@@ -910,6 +1002,38 @@ def parse_mrope_axes(axes: str | None) -> tuple[bool, bool, bool, bool]:
     enable_pos = ("pos" in s)
     enable_pitch = ("pitch" in s)
     return enable_index, enable_bar, enable_pos, enable_pitch
+
+def parse_alibi_axes(axes: str | None) -> tuple[bool, bool, bool, bool]:
+    """ALiBi に「移譲する」軸指定を (index, bar, pos, pitch) の有効/無効に変換する.
+
+    例:
+      - None / "" / "none" -> 全軸OFF
+      - "index"            -> index を ALiBi に回す（index RoPE を無効化して identity にする）
+      - "bar,pos"          -> bar と pos を ALiBi に回す（それらの RoPE を identity にする）
+      - "all"              -> 全軸を ALiBi に回す（RoPE は全軸 identity）
+    """
+    if axes is None:
+        axes = "none"
+    axes = str(axes).strip().lower()
+    if axes in ("", "none", "0", "false"):
+        return False, False, False, False
+    if axes in ("all", "*"):
+        return True, True, True, True
+
+    parts = (
+        axes.replace(",", " ")
+        .replace("|", " ")
+        .replace("+", " ")
+        .replace(";", " ")
+        .split()
+    )
+    s = set(parts)
+    alibi_index = ("index" in s) or ("idx" in s)
+    alibi_bar = ("bar" in s)
+    alibi_pos = ("pos" in s)
+    alibi_pitch = ("pitch" in s)
+    return alibi_index, alibi_bar, alibi_pos, alibi_pitch
+
 
 
 def has_ve(layer_idx, n_layer):
@@ -1135,13 +1259,21 @@ class GPT(nn.Module):
         # YaRN scaling on top of nanochat RoPE + 4-axis MRoPE
         # 軸の有効/無効は args.mrope_axes で切り替え可能（デフォルト: 全部有効）
         enable_index, enable_bar, enable_pos, enable_pitch = parse_mrope_axes(getattr(args, "mrope_axes", None))
+        alibi_index, alibi_bar, alibi_pos, alibi_pitch = parse_alibi_axes(getattr(args, "alibi_axes", None))
+
+        # ALiBi に移譲する軸は RoPE を無効化（該当ペアは identity）し、flash-attn 側の alibi_slopes に任せる。
+        # それ以外の軸は従来通り MRoPE（cos/sin 上書き）で回転する。
         self.yarn = Yarn(
             head_dim,
             max_seq_len,
-            enable_index=enable_index,
-            enable_bar=enable_bar,
-            enable_pos=enable_pos,
-            enable_pitch=enable_pitch,
+            enable_index=enable_index and (not alibi_index),
+            enable_bar=enable_bar and (not alibi_bar),
+            enable_pos=enable_pos and (not alibi_pos),
+            enable_pitch=enable_pitch and (not alibi_pitch),
+            alibi_index=alibi_index,
+            alibi_bar=alibi_bar,
+            alibi_pos=alibi_pos,
+            alibi_pitch=alibi_pitch,
         )
 
         # Optional: ALiBi (FlashAttention-2) を使う場合は slopes を flash_attn_varlen_func に渡す
@@ -1684,8 +1816,10 @@ class Hyperparameters:
 
     # positional encoding
     # - mrope_axes: "index,bar,pos,pitch" / "index,pos" / "none" / "all" など
+    # - alibi_axes: "index" / "bar,pos" / "none" / "all" など（該当軸の RoPE を identity にして ALiBi に移譲）
     # - use_alibi: FlashAttention-2 の alibi_slopes を使って ALiBi を有効化（RoPE と併用も可）
     mrope_axes: str = "index,bar,pos,pitch"
+    alibi_axes: str = "none"
     use_alibi: bool = False
 
 args = Hyperparameters()
