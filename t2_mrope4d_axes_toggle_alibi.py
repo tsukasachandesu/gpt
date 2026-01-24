@@ -1,0 +1,1864 @@
+import os
+import sys
+
+with open(sys.argv[0]) as f:
+    code = f.read()  # read the code of this file ASAP, for logging
+import copy
+import glob
+import math
+import threading
+import time
+import uuid
+from dataclasses import dataclass
+from functools import partial
+from itertools import cycle
+from pathlib import Path
+import gc
+
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+import torch
+
+torch.empty(
+    1, device=f"cuda:{os.environ['LOCAL_RANK']}", requires_grad=True
+).backward()  # prevents a bug on some systems
+import torch._dynamo as dynamo
+import torch.distributed as dist
+import torch.nn.functional as F
+
+# torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
+from torch import Tensor, nn
+
+dynamo.config.recompile_limit = 64
+
+
+# Computed for num_iters=5, safety_factor=2e-2, cushion=2
+polar_express_coeffs = [
+    (8.156554524902461, -22.48329292557795, 15.878769915207462),
+    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
+    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323)
+]
+
+# -----------------------------------------------------------------------------
+# Muon optimizer (from nanochat/muon.py)
+
+@torch.compile(dynamic=False, fullgraph=True)
+def muon_step_fused(
+    stacked_grads: Tensor,
+    stacked_params: Tensor,
+    momentum_buffer: Tensor,
+    second_momentum_buffer: Tensor,
+    momentum_t: Tensor,
+    lr_t: Tensor,
+    wd_t: Tensor,
+    beta2_t: Tensor,
+    ns_steps: int,
+    red_dim: int,
+) -> None:
+    """
+    Fused Muon step: momentum -> polar_express -> variance_reduction -> cautious_update.
+    Uses polar_express_coeffs defined above.
+    """
+    # Nesterov momentum
+    momentum = momentum_t.to(stacked_grads.dtype)
+    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
+    g = stacked_grads.lerp_(momentum_buffer, momentum)
+
+    # Polar express
+    X = g.bfloat16()
+    if g.size(-2) > g.size(-1):
+        X = X.mT
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
+    for a, b, c in polar_express_coeffs[:ns_steps]:
+        A = X @ X.mT
+        B = b * A + c * (A @ A)
+        X = a * X + B @ X
+    if g.size(-2) > g.size(-1):
+        X = X.mT
+    g = X
+
+    # Variance reduction
+    beta2 = beta2_t.to(g.dtype)
+    v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
+    red_dim_size = g.size(red_dim)
+    v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
+    v_norm = v_norm_sq.sqrt()
+    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
+    step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
+    scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
+    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
+    final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
+    g = g * final_scale.to(g.dtype)
+
+    # Cautious weight decay + parameter update
+    lr = lr_t.to(g.dtype)
+    wd = wd_t.to(g.dtype)
+    mask = (g * stacked_params) >= 0
+    stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+
+
+class Muon(torch.optim.Optimizer):
+    """
+    Muon - MomentUm Orthogonalized by Newton-Schulz (Polar Express variant).
+    """
+    def __init__(self, params, lr=0.02, momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=0.0):
+        defaults = dict(lr=lr, momentum=momentum, ns_steps=ns_steps, beta2=beta2, weight_decay=weight_decay)
+        assert all(p.ndim == 2 for p in params), "Muon expects 2D parameters only"
+        params = list(params)
+        shapes = sorted({p.shape for p in params})
+        param_groups = []
+        for shape in shapes:
+            group_params = [p for p in params if p.shape == shape]
+            param_groups.append(dict(params=group_params))
+        super().__init__(param_groups, defaults)
+        # 0-D CPU tensors to avoid torch.compile recompilation when values change
+        self._momentum_t = torch.tensor(0.0, dtype=torch.float32, device='cpu')
+        self._lr_t = torch.tensor(0.0, dtype=torch.float32, device='cpu')
+        self._wd_t = torch.tensor(0.0, dtype=torch.float32, device='cpu')
+        self._beta2_t = torch.tensor(0.0, dtype=torch.float32, device='cpu')
+
+    def reset(self):
+        for group in self.param_groups:
+            params = group.get('params', [])
+            if not params:
+                continue
+            state = self.state.get(params[0], None)
+            if not state:
+                continue
+            for key in ("momentum_buffer", "second_momentum_buffer"):
+                if key in state:
+                    state[key].zero_()
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            params: list[Tensor] = group["params"]
+            if not params:
+                continue
+
+            state = self.state[params[0]]
+            num_params = len(params)
+            shape, device, dtype = params[0].shape, params[0].device, params[0].dtype
+
+            if "momentum_buffer" not in state:
+                state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
+            momentum_buffer = state["momentum_buffer"]
+
+            if "second_momentum_buffer" not in state:
+                if shape[-2] >= shape[-1]:
+                    state["second_momentum_buffer"] = torch.zeros(num_params, shape[-2], 1, dtype=dtype, device=device)
+                else:
+                    state["second_momentum_buffer"] = torch.zeros(num_params, 1, shape[-1], dtype=dtype, device=device)
+            second_momentum_buffer = state["second_momentum_buffer"]
+            red_dim = -1 if shape[-2] >= shape[-1] else -2
+
+            stacked_grads = torch.stack([p.grad for p in params])
+            stacked_params = torch.stack(params)
+
+            self._momentum_t.fill_(group["momentum"])
+            self._beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
+            self._lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1]) ** 0.5)
+            self._wd_t.fill_(group["weight_decay"])
+
+            muon_step_fused(
+                stacked_grads,
+                stacked_params,
+                momentum_buffer,
+                second_momentum_buffer,
+                self._momentum_t,
+                self._lr_t,
+                self._wd_t,
+                self._beta2_t,
+                group["ns_steps"],
+                red_dim,
+            )
+
+            torch._foreach_copy_(params, list(stacked_params.unbind(0)))
+
+
+class DistMuon(torch.optim.Optimizer):
+    """
+    Distributed version of the Muon optimizer.
+    """
+    def __init__(self, params, lr: float = 0.02, momentum: float = 0.95, ns_steps: int = 5, beta2: float = 0.95, weight_decay: float = 0.0):
+        defaults = dict(lr=lr, momentum=momentum, ns_steps=ns_steps, beta2=beta2, weight_decay=weight_decay)
+        assert all(p.ndim == 2 for p in params), "Muon expects 2D parameters only"
+        params = list(params)
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        # Group all parameters by their shape
+        shapes = sorted({p.shape for p in params})
+        param_groups = []
+        for shape in shapes:
+            group_params = [p for p in params if p.shape == shape]
+            device, dtype = group_params[0].device, group_params[0].dtype
+            assert all(p.device == device for p in group_params)
+            assert all(p.dtype == dtype for p in group_params)
+            chunk_size = (len(group_params) + world_size - 1) // world_size
+            if rank == 0:
+                print(f"Muon: {len(group_params)} params of shape {shape}, chunk_size={chunk_size}")
+            param_groups.append(dict(params=group_params, chunk_size=chunk_size))
+        super().__init__(param_groups, defaults)
+        self._momentum_t = torch.tensor(0.0, dtype=torch.float32, device='cpu')
+        self._lr_t = torch.tensor(0.0, dtype=torch.float32, device='cpu')
+        self._wd_t = torch.tensor(0.0, dtype=torch.float32, device='cpu')
+        self._beta2_t = torch.tensor(0.0, dtype=torch.float32, device='cpu')
+
+    def reset(self):
+        for group in self.param_groups:
+            params = group.get('params', [])
+            if not params:
+                continue
+            state = self.state.get(params[0], None)
+            if not state:
+                continue
+            for key in ("momentum_buffer", "second_momentum_buffer"):
+                if key in state:
+                    state[key].zero_()
+
+    @torch.no_grad()
+    def step(self):
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+
+        assert all(p.grad is not None for group in self.param_groups for p in group["params"]), "All params must have grads"
+
+        group_infos = []
+        for group in self.param_groups:
+            params: list[Tensor] = group["params"]
+            chunk_size = group["chunk_size"]
+            padded_num_params = chunk_size * world_size
+            shape = params[0].shape
+            device, dtype = params[0].device, params[0].dtype
+
+            grad_stack = torch.stack([p.grad for p in params])
+            stacked_grads = torch.empty(padded_num_params, *shape, dtype=dtype, device=device)
+            stacked_grads[:len(params)].copy_(grad_stack)
+            if len(params) < padded_num_params:
+                stacked_grads[len(params):].zero_()
+
+            grad_chunk = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
+            reduce_future = dist.reduce_scatter_tensor(
+                grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True
+            ).get_future()
+
+            group_infos.append(dict(
+                grad_chunk=grad_chunk,
+                reduce_future=reduce_future,
+                stacked_grads=stacked_grads,
+            ))
+
+        all_gather_futures = []
+        for group, info in zip(self.param_groups, group_infos):
+            info["reduce_future"].wait()
+
+            params = group["params"]
+            chunk_size = group["chunk_size"]
+            shape = params[0].shape
+            device, dtype = params[0].device, params[0].dtype
+            grad_chunk = info["grad_chunk"]
+
+            start_idx = rank * chunk_size
+            num_owned = min(chunk_size, max(0, len(params) - start_idx))
+
+            state = self.state[params[0]]
+
+            if "momentum_buffer" not in state:
+                state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
+            momentum_buffer = state["momentum_buffer"]
+
+            if "second_momentum_buffer" not in state:
+                if shape[-2] >= shape[-1]:
+                    state["second_momentum_buffer"] = torch.zeros(chunk_size, shape[-2], 1, dtype=dtype, device=device)
+                else:
+                    state["second_momentum_buffer"] = torch.zeros(chunk_size, 1, shape[-1], dtype=dtype, device=device)
+            second_momentum_buffer = state["second_momentum_buffer"]
+            red_dim = -1 if shape[-2] >= shape[-1] else -2
+
+            updated_params = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
+
+            if num_owned > 0:
+                owned_params = [params[start_idx + i] for i in range(num_owned)]
+                stacked_owned_params = torch.stack(owned_params)
+
+                owned_grads = grad_chunk[:num_owned]
+                owned_momentum = momentum_buffer[:num_owned]
+                owned_second_momentum = second_momentum_buffer[:num_owned]
+
+                self._momentum_t.fill_(group["momentum"])
+                self._beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
+                self._lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1]) ** 0.5)
+                self._wd_t.fill_(group["weight_decay"])
+
+                muon_step_fused(
+                    owned_grads,
+                    stacked_owned_params,
+                    owned_momentum,
+                    owned_second_momentum,
+                    self._momentum_t,
+                    self._lr_t,
+                    self._wd_t,
+                    self._beta2_t,
+                    group["ns_steps"],
+                    red_dim,
+                )
+
+                updated_params[:num_owned].copy_(stacked_owned_params)
+
+            if num_owned < chunk_size:
+                updated_params[num_owned:].zero_()
+
+            stacked_params = info["stacked_grads"]
+            gather_future = dist.all_gather_into_tensor(
+                stacked_params, updated_params, async_op=True
+            ).get_future()
+
+            all_gather_futures.append(dict(
+                gather_future=gather_future,
+                stacked_params=stacked_params,
+                params=params,
+            ))
+
+        for info in all_gather_futures:
+            info["gather_future"].wait()
+            stacked_params = info["stacked_params"]
+            params = info["params"]
+            torch._foreach_copy_(params, list(stacked_params[:len(params)].unbind(0)))
+
+
+# -----------------------------------------------------------------------------
+# Distributed AdamW optimizer (from nanochat/adamw.py)
+
+@torch.compile(dynamic=False, fullgraph=True)
+def adamw_step_fused(
+    p: Tensor,
+    grad: Tensor,
+    exp_avg: Tensor,
+    exp_avg_sq: Tensor,
+    step_t: Tensor,
+    lr_t: Tensor,
+    beta1_t: Tensor,
+    beta2_t: Tensor,
+    eps_t: Tensor,
+    wd_t: Tensor,
+) -> None:
+    """
+    Fused AdamW step: weight_decay -> momentum_update -> bias_correction -> param_update.
+    Uses 0-D CPU tensors to avoid recompilation when hyperparameters change.
+    """
+    # Weight decay (decoupled, applied before the update)
+    p.mul_(1 - lr_t * wd_t)
+    # Update running averages
+    exp_avg.lerp_(grad, 1 - beta1_t)
+    exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
+    # Bias corrections
+    bias1 = 1 - beta1_t ** step_t
+    bias2 = 1 - beta2_t ** step_t
+    # Compute update and apply
+    denom = (exp_avg_sq / bias2).sqrt() + eps_t
+    step_size = lr_t / bias1
+    p.add_(exp_avg / denom, alpha=-step_size)
+
+
+class DistAdamW(torch.optim.Optimizer):
+    """
+    Distributed AdamW optimizer with sharded optimizer states (ZeRO-2 style).
+    """
+    def __init__(self, param_groups, lr: float = 1e-3, betas: tuple[float, float] = (0.9, 0.999), eps: float = 1e-8, weight_decay: float = 0.01):
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        # Validate
+        if rank == 0:
+            for group in param_groups:
+                assert isinstance(group, dict), "expecting param_groups to be a list of dicts"
+                assert isinstance(group["params"], list), "expecting group['params'] to be a list of tensors"
+                for p in group["params"]:
+                    sliced = p.numel() >= 1024
+                    print(f"AdamW: 1 param of shape {p.shape}, sliced={sliced}")
+                    if sliced:
+                        assert p.shape[0] % world_size == 0, f"First dim of parameter shape {p.shape} must be divisible by world size {world_size}"
+        super().__init__(param_groups, defaults)
+        # 0-D CPU tensors to avoid torch.compile recompilation when values change
+        self._step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+
+    @torch.no_grad()
+    def step(self):
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        reduce_futures: list[torch.Future] = []
+        gather_futures: list[torch.Future] = []
+        grad_slices = []
+        is_small = []
+
+        for group in self.param_groups:
+            params: list[Tensor] = group["params"]
+            for p in params:
+                grad = p.grad
+                if p.numel() < 1024:
+                    is_small.append(True)
+                    reduce_futures.append(
+                        dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
+                    )
+                    grad_slices.append(grad)
+                else:
+                    is_small.append(False)
+                    rank_size = grad.shape[0] // world_size
+                    grad_slice = torch.empty_like(grad[:rank_size])
+                    reduce_futures.append(
+                        dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
+                    )
+                    grad_slices.append(grad_slice)
+
+        idx = 0
+        for group in self.param_groups:
+            beta1, beta2 = group["betas"]
+            eps = group["eps"]
+            wd = group["weight_decay"]
+            params = group["params"]
+            for p in params:
+                reduce_futures[idx].wait()
+                g_slice = grad_slices[idx]
+                lr = group["lr"] * getattr(p, "lr_mul", 1.0)
+                state = self.state[p]
+
+                if is_small[idx]:
+                    p_slice = p
+                else:
+                    rank_size = p.shape[0] // world_size
+                    p_slice = p[rank * rank_size:(rank + 1) * rank_size]
+
+                if not state:
+                    state["step"] = 0
+                    state["exp_avg"] = torch.zeros_like(p_slice)
+                    state["exp_avg_sq"] = torch.zeros_like(p_slice)
+                exp_avg = state["exp_avg"]
+                exp_avg_sq = state["exp_avg_sq"]
+                state["step"] += 1
+
+                eff_wd = wd * getattr(p, "wd_mul", 1.0)
+                self._step_t.fill_(state["step"])
+                self._lr_t.fill_(lr)
+                self._beta1_t.fill_(beta1)
+                self._beta2_t.fill_(beta2)
+                self._eps_t.fill_(eps)
+                self._wd_t.fill_(eff_wd)
+
+                adamw_step_fused(
+                    p_slice, g_slice, exp_avg, exp_avg_sq,
+                    self._step_t, self._lr_t, self._beta1_t, self._beta2_t, self._eps_t, self._wd_t,
+                )
+
+                if not is_small[idx]:
+                    gather_futures.append(
+                        dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future()
+                    )
+                idx += 1
+
+        if gather_futures:
+            torch.futures.collect_all(gather_futures).wait()
+
+
+# -----------------------------------------------------------------------------
+# PyTorch nn.Module definitions for the model
+
+def norm(x: Tensor):
+    return F.rms_norm(x, (x.size(-1),))
+
+# YaRN + 4-axis MRoPE (index / bar / pos / pitch) @classiclarryd
+#
+# * Interleaved-MRoPE compatible (fixed stride overwrite, default stride=4)
+# * half-truncate RoPE is NOT used here (full rotary frequencies)
+
+
+def forward_fill_from_updates(updates: Tensor, update_mask: Tensor, idx: Tensor) -> Tensor:
+    """Forward-fill (last observation carried forward).
+
+    本コードの用途（MRoPE の bar/pos/pitch インデックス生成）に特化して、
+    **1次元 (T,)** を高速に処理する。
+
+    Args:
+        updates: (T,) int tensor
+            update_mask=True の位置に「新しい値」が入っている。
+        update_mask: (T,) bool
+        idx: (T,) int tensor
+            0..T-1 のインデックス（呼び出し側で一度だけ作って使い回す）
+
+    Returns:
+        (T,) で、各時刻が直近の update 値に置き換わる。
+        直近の update がまだ存在しない区間は 0。
+
+    Notes:
+        * torch.compile 安定（Python ループ無し）
+        * gather の index は int64 が必要なので最後に変換する
+    """
+    # updates/update_mask は (T,) 前提
+    upd_idx = torch.where(update_mask, idx, idx.new_full((), -1).expand_as(idx))
+    last_idx = torch.cummax(upd_idx, dim=0)[0]
+    last_idx_clamped = last_idx.clamp_min(0).to(dtype=torch.int64)
+    out = updates.gather(0, last_idx_clamped)
+    out = torch.where(last_idx >= 0, out, torch.zeros_like(out))
+    return out
+
+
+class Yarn(nn.Module):
+    """YaRN + 4-axis MRoPE（index / bar / pos / pitch）.
+
+    互換性目標:
+      * Qwen 系で使われる Interleaved-MRoPE の「固定ストライド上書き」を 4軸に拡張。
+
+    設計方針:
+      * trig（cos/sin）は forward では計算しない（キャッシュ参照のみ）
+      * 4軸の cos/sin をトークン列から生成し、各層で共有して使用
+      * torch.compile に乗る（Python ループなし）
+
+    注意:
+      * half-truncate RoPE は使用しない（全周波数で回転する）
+      * 4軸は enable_index/enable_bar/enable_pos/enable_pitch で個別に ON/OFF 可能
+        - OFF の軸は「上書きしない」ため、その軸に割り当てられたペアは base（index または identity）で回転する
+    """
+
+    def __init__(
+        self,
+        head_dim: int,
+        max_seq_len: int,
+        base: int = 10000,
+        *,
+        # token ID 設定（本コードベースのデフォルト語彙に合わせる）
+        pitch_start: int = 0,
+        pitch_size: int = 128,
+        bar_id: int | None = 128,
+        pos_start: int = 129,
+        pos_size: int = 32,
+        # doc 境界（BOS=161 が既定。None で無効化）
+        doc_id: int | None = 161,
+        # pitch/pos の forward-fill と reset 条件
+        carry_pitch: bool = True,
+        reset_pitch_on_pos: bool = True,
+        reset_pitch_on_bar: bool = True,
+        # 0 を「軸無効」に予約したい場合のオフセット
+        pos_idx_offset: int = 1,
+        pitch_idx_offset: int = 1,
+        # pitch 回転のゲート
+        pitch_gate: str = 'pitch_tok_only',
+        # rotary pairs の割当（head_dim/2 を 4軸に分配）
+        axial_fractions: tuple[int, int, int, int] = (1, 1, 1, 1),
+        # ペア並び: 'interleave'（Qwen互換） or 'block'
+        pair_layout: str = 'interleave',
+        # 軸ごとの ON/OFF（学習中に切り替える場合は torch.compile の再コンパイル要因になり得る）
+        enable_index: bool = True,
+        enable_bar: bool = True,
+        enable_pos: bool = True,
+        enable_pitch: bool = True,
+    ):
+        super().__init__()
+        if head_dim % 2 != 0:
+            raise ValueError(f"head_dim must be even, got {head_dim}")
+        self.head_dim = int(head_dim)
+        self.max_seq_len = int(max_seq_len)
+        self.base = int(base)
+
+        self.pitch_start = int(pitch_start)
+        self.pitch_size = int(pitch_size)
+        self.bar_id = int(bar_id) if bar_id is not None else None
+        self.pos_start = int(pos_start)
+        self.pos_size = int(pos_size)
+        self.doc_id = int(doc_id) if doc_id is not None else None
+
+        self.carry_pitch = bool(carry_pitch)
+        self.reset_pitch_on_pos = bool(reset_pitch_on_pos)
+        self.reset_pitch_on_bar = bool(reset_pitch_on_bar)
+
+        self.pos_idx_offset = int(pos_idx_offset)
+        self.pitch_idx_offset = int(pitch_idx_offset)
+        if self.pos_idx_offset < 0 or self.pitch_idx_offset < 0:
+            raise ValueError('pos_idx_offset and pitch_idx_offset must be >= 0')
+        self.pos_cache_len = int(self.pos_size + self.pos_idx_offset)
+        self.pitch_cache_len = int(self.pitch_size + self.pitch_idx_offset)
+
+        self.pitch_gate = str(pitch_gate).lower()
+        if self.pitch_gate not in ('none', 'pitch_tok_only'):
+            raise ValueError(f"pitch_gate must be 'none' or 'pitch_tok_only', got {pitch_gate!r}")
+
+        self.pair_layout = str(pair_layout).lower()
+        if self.pair_layout not in ('block', 'interleave'):
+            raise ValueError(f"pair_layout must be 'block' or 'interleave', got {pair_layout!r}")
+
+        # axis enables (kept as Python bools: no tensor overhead)
+        self.enable_index = bool(enable_index)
+        self.enable_bar = bool(enable_bar)
+        self.enable_pos = bool(enable_pos)
+        self.enable_pitch = bool(enable_pitch)
+
+        # split head_dim/2 pairs across 4 axes
+        total_pairs = self.head_dim // 2
+        self.pairs_index, self.pairs_bar, self.pairs_pos, self.pairs_pitch = self._allocate_pairs(
+            total_pairs, axial_fractions
+        )
+        self.mrope_section = (self.pairs_index, self.pairs_bar, self.pairs_pos, self.pairs_pitch)
+        if sum(self.mrope_section) != total_pairs:
+            raise RuntimeError('Internal error: mrope_section does not sum to total_pairs')
+
+        # Validate interleaved fixed-stride feasibility (enabled axes only)
+        if self.pair_layout == 'interleave':
+            num_axes = 4
+            for axis_id, sec in enumerate(self.mrope_section):
+                if axis_id == 0 or sec <= 0:
+                    continue
+                if axis_id == 1 and (not self.enable_bar):
+                    continue
+                if axis_id == 2 and (not self.enable_pos):
+                    continue
+                if axis_id == 3 and (not self.enable_pitch):
+                    continue
+                max_idx = axis_id + num_axes * (sec - 1)
+                if max_idx >= total_pairs:
+                    raise ValueError(
+                        "pair_layout='interleave' cannot represent this allocation with fixed stride: "
+                        f"axis={axis_id} sec={sec} total_pairs={total_pairs} -> max_idx={max_idx}. "
+                        "Reduce axial_fractions for non-base axes or use pair_layout='block'."
+                    )
+
+        self.reset()
+
+    @staticmethod
+    def _allocate_pairs(total_pairs: int, ratios: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+        r0, r1, r2, r3 = (int(r) for r in ratios)
+        if min(r0, r1, r2, r3) <= 0:
+            raise ValueError(f"axial_fractions must be positive, got {ratios}")
+        denom = r0 + r1 + r2 + r3
+        scaled = [total_pairs * r0, total_pairs * r1, total_pairs * r2, total_pairs * r3]
+        base = [s // denom for s in scaled]
+        frac = [s % denom for s in scaled]
+        rem = total_pairs - sum(base)
+        order = sorted(range(4), key=lambda i: (-frac[i], i))
+        for i in order[:rem]:
+            base[i] += 1
+        return base[0], base[1], base[2], base[3]
+
+    def set_axes(
+        self,
+        *,
+        index: bool | None = None,
+        bar: bool | None = None,
+        pos: bool | None = None,
+        pitch: bool | None = None,
+    ) -> None:
+        """4軸の有効/無効を切り替える（必要なら外部から呼ぶ）."""
+        if index is not None:
+            self.enable_index = bool(index)
+        if bar is not None:
+            self.enable_bar = bool(bar)
+        if pos is not None:
+            self.enable_pos = bool(pos)
+        if pitch is not None:
+            self.enable_pitch = bool(pitch)
+
+    def reset(self):
+        # base inv_freq (full RoPE; no half-truncate)
+        inv_freq = 1.0 / (
+            self.base ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=device) / self.head_dim)
+        )
+        self.inv_freq = inv_freq
+
+        # cos/sin caches per axis (all axes share the same inv_freq; axis ごとに position id だけを変える)
+        total_pairs = self.head_dim // 2
+
+        # index: [0..T)
+        t = torch.arange(self.max_seq_len, dtype=torch.float32, device=device)
+        theta = torch.outer(t, inv_freq)
+        self._cos_index = nn.Buffer(theta.cos().to(torch.bfloat16), persistent=False)
+        self._sin_index = nn.Buffer(theta.sin().to(torch.bfloat16), persistent=False)
+        assert self._cos_index.size(1) == total_pairs
+
+        # bar: cumulative count, upper bound <= seq_len
+        t_bar = torch.arange(self.max_seq_len + 1, dtype=torch.float32, device=device)
+        theta_bar = torch.outer(t_bar, inv_freq)
+        self._cos_bar = nn.Buffer(theta_bar.cos().to(torch.bfloat16), persistent=False)
+        self._sin_bar = nn.Buffer(theta_bar.sin().to(torch.bfloat16), persistent=False)
+
+        # pos/pitch: small categorical indices
+        t_pos = torch.arange(self.pos_cache_len, dtype=torch.float32, device=device)
+        theta_pos = torch.outer(t_pos, inv_freq)
+        self._cos_pos = nn.Buffer(theta_pos.cos().to(torch.bfloat16), persistent=False)
+        self._sin_pos = nn.Buffer(theta_pos.sin().to(torch.bfloat16), persistent=False)
+
+        t_pitch = torch.arange(self.pitch_cache_len, dtype=torch.float32, device=device)
+        theta_pitch = torch.outer(t_pitch, inv_freq)
+        self._cos_pitch = nn.Buffer(theta_pitch.cos().to(torch.bfloat16), persistent=False)
+        self._sin_pitch = nn.Buffer(theta_pitch.sin().to(torch.bfloat16), persistent=False)
+
+        # (T,) 用の 0..max_seq_len-1 インデックス（forward で arange を作らない）
+        self._idx_cache = nn.Buffer(
+            torch.arange(self.max_seq_len, dtype=torch.int32, device=device), persistent=False
+        )
+
+        # attn scale
+        self.attn_scale = 0.1
+
+    def apply(self, old_window: int, new_window: int, alpha: int = 1, beta: int = 32):
+        # YaRN frequency scaling (index/bar 用の inv_freq を更新し、キャッシュも更新)
+        rotations = args.block_size * old_window * self.inv_freq / (2 * torch.pi)
+        scaling_factor = old_window / new_window
+        interpolation_weight = torch.clamp((rotations - alpha) / (beta - alpha), 0, 1)
+        self.inv_freq *= scaling_factor + interpolation_weight * (1 - scaling_factor)
+
+        # rebuild index cache
+        t = torch.arange(self.max_seq_len, dtype=torch.float32, device=self.inv_freq.device)
+        theta = torch.outer(t, self.inv_freq)
+        self._cos_index.copy_(theta.cos().to(self._cos_index.dtype))
+        self._sin_index.copy_(theta.sin().to(self._sin_index.dtype))
+
+        # rebuild bar cache
+        t_bar = torch.arange(self.max_seq_len + 1, dtype=torch.float32, device=self.inv_freq.device)
+        theta_bar = torch.outer(t_bar, self.inv_freq)
+        self._cos_bar.copy_(theta_bar.cos().to(self._cos_bar.dtype))
+        self._sin_bar.copy_(theta_bar.sin().to(self._sin_bar.dtype))
+
+        # pos/pitch は短距離で使うことが多いため、ここでは変更しない（必要なら reset() で全更新）
+        self.attn_scale *= 0.2 * math.log(new_window / old_window) + 1
+
+    def forward(self, token_ids: Tensor) -> tuple[Tensor, Tensor]:
+        # token_ids: (T,) を想定（本コードは packed-varlen だが B==1 前提）
+        if token_ids.ndim == 2:
+            if token_ids.size(0) != 1:
+                raise ValueError('This codebase expects packed varlen with B==1; provide token_ids as (T,) or (1,T).')
+            token_ids = token_ids.squeeze(0)
+        if token_ids.ndim != 1:
+            raise ValueError(f"token_ids must be 1D, got shape={tuple(token_ids.shape)}")
+
+        T = token_ids.size(0)
+        if T > self.max_seq_len:
+            raise ValueError(f"sequence length {T} exceeds rotary cache length {self.max_seq_len}")
+
+        # Which axes do we actually apply?
+        use_bar = self.enable_bar and (self.pairs_bar > 0)
+        use_pos = self.enable_pos and (self.pairs_pos > 0)
+        use_pitch = self.enable_pitch and (self.pairs_pitch > 0)
+        need_extra = use_bar or use_pos or use_pitch
+
+        # Always slice the base cache (cheap view); used as base or identity source
+        cos_index = self._cos_index[:T]
+        sin_index = self._sin_index[:T]
+
+        # Fast path: pure index (or pure identity) RoPE
+        if not need_extra:
+            if self.enable_index:
+                cos = cos_index
+                sin = sin_index
+            else:
+                # position=0 (cos=1, sin=0) expanded => identity rotation
+                cos = cos_index[:1].expand(T, -1)
+                sin = sin_index[:1].expand(T, -1)
+            return cos[None, :, None, :], sin[None, :, None, :]
+
+        tok = token_ids.to(torch.int32) if token_ids.dtype != torch.int32 else token_ids
+        idx = self._idx_cache[:T]
+
+        # 必要な token mask だけを計算する（軸 toggle による無駄な比較を避ける）
+        need_doc_tok = (self.doc_id is not None) and (use_bar or use_pos or use_pitch)
+        doc_tok = tok.eq(self.doc_id) if need_doc_tok else torch.zeros_like(tok, dtype=torch.bool)
+
+        need_bar_tok = (self.bar_id is not None) and (
+            use_bar or use_pos or (use_pitch and self.carry_pitch and self.reset_pitch_on_bar)
+        )
+        bar_tok = tok.eq(self.bar_id) if need_bar_tok else torch.zeros_like(tok, dtype=torch.bool)
+
+        need_pos_tok = use_pos or (use_pitch and self.carry_pitch and self.reset_pitch_on_pos)
+        pos_tok = (
+            (tok >= self.pos_start) & (tok < (self.pos_start + self.pos_size))
+            if need_pos_tok
+            else torch.zeros_like(tok, dtype=torch.bool)
+        )
+
+        pitch_tok = (
+            (tok >= self.pitch_start) & (tok < (self.pitch_start + self.pitch_size))
+            if use_pitch
+            else torch.zeros_like(tok, dtype=torch.bool)
+        )
+
+        # gather cos/sin per enabled axis (shape: [T, total_pairs])
+        cos_bar = sin_bar = None
+        if use_bar:
+            # bar index: cumulative count of bar tokens, reset at doc boundaries
+            bar_idx = torch.cumsum(bar_tok.to(dtype=torch.int32), dim=0, dtype=torch.int32)
+            if self.doc_id is not None:
+                bar_offset = forward_fill_from_updates(bar_idx, doc_tok, idx)
+                bar_idx = bar_idx - bar_offset
+            bar_idx = bar_idx.clamp(0, self._cos_bar.size(0) - 1)
+            cos_bar = F.embedding(bar_idx, self._cos_bar)
+            sin_bar = F.embedding(bar_idx, self._sin_bar)
+
+        cos_pos = sin_pos = None
+        if use_pos:
+            # pos index: forward-fill from pos tokens, reset on bar/doc
+            pos_updates = torch.where(
+                pos_tok,
+                (tok - self.pos_start + self.pos_idx_offset).to(dtype=torch.int32),
+                torch.zeros_like(tok, dtype=torch.int32),
+            )
+            pos_update_mask = pos_tok | bar_tok | doc_tok
+            pos_idx = forward_fill_from_updates(pos_updates, pos_update_mask, idx)
+            pos_idx = pos_idx.clamp(0, self.pos_cache_len - 1)
+            cos_pos = F.embedding(pos_idx, self._cos_pos)
+            sin_pos = F.embedding(pos_idx, self._sin_pos)
+
+        cos_pitch = sin_pitch = None
+        if use_pitch:
+            # pitch index: forward-fill from pitch tokens, reset optionally
+            pitch_updates = torch.where(
+                pitch_tok,
+                (tok - self.pitch_start + self.pitch_idx_offset).to(dtype=torch.int32),
+                torch.zeros_like(tok, dtype=torch.int32),
+            )
+            if self.carry_pitch:
+                pitch_update_mask = pitch_tok | doc_tok
+                if self.reset_pitch_on_pos:
+                    pitch_update_mask = pitch_update_mask | pos_tok
+                if self.reset_pitch_on_bar:
+                    pitch_update_mask = pitch_update_mask | bar_tok
+                pitch_idx = forward_fill_from_updates(pitch_updates, pitch_update_mask, idx)
+            else:
+                pitch_idx = pitch_updates
+
+            if self.pitch_gate == 'pitch_tok_only':
+                pitch_idx = pitch_idx.masked_fill(~pitch_tok, 0)
+
+            pitch_idx = pitch_idx.clamp(0, self.pitch_cache_len - 1)
+            cos_pitch = F.embedding(pitch_idx, self._cos_pitch)
+            sin_pitch = F.embedding(pitch_idx, self._sin_pitch)
+
+        # base: index RoPE or identity
+        if self.enable_index:
+            cos_base = cos_index
+            sin_base = sin_index
+        else:
+            cos_base = cos_index[:1].expand(T, -1)
+            sin_base = sin_index[:1].expand(T, -1)
+
+        # Merge: clone once, then overwrite enabled axes only (no extra elementwise masking)
+        cos = cos_base.clone()
+        sin = sin_base.clone()
+
+        if self.pair_layout == 'block':
+            s0, s1, s2, s3 = self.mrope_section
+            o1 = s0
+            o2 = s0 + s1
+            o3 = s0 + s1 + s2
+            if use_bar:
+                cos[:, o1:o2] = cos_bar[:, o1:o2]
+                sin[:, o1:o2] = sin_bar[:, o1:o2]
+            if use_pos:
+                cos[:, o2:o3] = cos_pos[:, o2:o3]
+                sin[:, o2:o3] = sin_pos[:, o2:o3]
+            if use_pitch:
+                cos[:, o3:] = cos_pitch[:, o3:]
+                sin[:, o3:] = sin_pitch[:, o3:]
+        else:
+            # interleaved fixed-stride overwrite (Qwen style)
+            stride = 4
+            if use_bar:
+                end = int(self.pairs_bar) * stride
+                cos[:, 1:end:stride] = cos_bar[:, 1:end:stride]
+                sin[:, 1:end:stride] = sin_bar[:, 1:end:stride]
+            if use_pos:
+                end = int(self.pairs_pos) * stride
+                cos[:, 2:end:stride] = cos_pos[:, 2:end:stride]
+                sin[:, 2:end:stride] = sin_pos[:, 2:end:stride]
+            if use_pitch:
+                end = int(self.pairs_pitch) * stride
+                cos[:, 3:end:stride] = cos_pitch[:, 3:end:stride]
+                sin[:, 3:end:stride] = sin_pitch[:, 3:end:stride]
+
+        # shape to [1, T, 1, D/2] for apply_rotary_emb()
+        return cos[None, :, None, :], sin[None, :, None, :]
+
+
+def parse_mrope_axes(axes: str | None) -> tuple[bool, bool, bool, bool]:
+    """MRoPE の軸指定を (index, bar, pos, pitch) の有効/無効に変換する.
+
+    例:
+      - "index,bar,pos,pitch" (デフォルト)
+      - "index,pos"
+      - "none" -> 全軸無効（RoPE を完全に無効化）
+      - "all"  -> 全軸有効
+    """
+    if axes is None:
+        axes = "index,bar,pos,pitch"
+    axes = str(axes).strip().lower()
+    if axes in ("", "all", "*"):
+        return True, True, True, True
+    if axes in ("none", "0", "false"):
+        return False, False, False, False
+
+    parts = (
+        axes.replace(",", " ")
+        .replace("|", " ")
+        .replace("+", " ")
+        .replace(";", " ")
+        .split()
+    )
+    s = set(parts)
+    enable_index = ("index" in s) or ("idx" in s)
+    enable_bar = ("bar" in s)
+    enable_pos = ("pos" in s)
+    enable_pitch = ("pitch" in s)
+    return enable_index, enable_bar, enable_pos, enable_pitch
+
+
+def has_ve(layer_idx, n_layer):
+    """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
+    return layer_idx % 2 == (n_layer - 1) % 2
+
+
+def apply_rotary_emb(x, cos, sin):
+    assert x.ndim == 4  # multihead attention
+    d = x.shape[3] // 2
+    x1, x2 = x[..., :d], x[..., d:]
+    y1 = x1 * cos + x2 * sin
+    y2 = x1 * (-sin) + x2 * cos
+    return torch.cat([y1, y2], 3)
+
+
+@dataclass
+class AttnArgs:
+    seqlens: torch.Tensor
+    cos: torch.Tensor
+    sin: torch.Tensor
+    attn_scale: float
+    window_size: tuple[int, int]
+    # FlashAttention-2 の ALiBi 実装を使う場合に渡す（None なら無効）
+    alibi_slopes: torch.Tensor | None = None
+
+
+# FlashAttention-2 (flash_attn_varlen_func) を優先して使い、無ければ interface をフォールバックする
+# - ALiBi は FlashAttention 側の alibi_slopes 引数でカーネル内に加算できる（バイアスマトリクスを作らない）
+#   ただし flash-attn のバージョン差分で引数が存在しない場合があるため、kwargs 対応を検出して安全に分岐する。
+import inspect
+
+
+def _fn_accepts_kwarg(fn, kw: str) -> bool:
+    try:
+        return kw in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        # C-extension 関数は signature が取れないことがあるため、text signature / docstring を参照
+        text_sig = getattr(fn, "__text_signature__", "") or ""
+        if kw in text_sig:
+            return True
+        doc = getattr(fn, "__doc__", "") or ""
+        return kw in doc
+
+
+try:
+    # User 要望: FlashAttention-2 では "from flash_attn import flash_attn_varlen_func" を優先
+    from flash_attn import flash_attn_varlen_func as _flash_attn_varlen_func  # type: ignore
+    _FLASH_ATTN_VARLEN_FUNC_SRC = "flash_attn.flash_attn_varlen_func"
+except Exception:
+    from flash_attn import flash_attn_interface  # type: ignore
+    _flash_attn_varlen_func = flash_attn_interface.flash_attn_varlen_func
+    _FLASH_ATTN_VARLEN_FUNC_SRC = "flash_attn.flash_attn_interface.flash_attn_varlen_func"
+
+FLASH_ATTN_SUPPORTS_ALIBI_SLOPES = _fn_accepts_kwarg(_flash_attn_varlen_func, "alibi_slopes")
+
+
+def build_alibi_slopes(num_heads: int, *, device: torch.device | None = None) -> torch.Tensor:
+    """ALiBi slopes (fp32) を返す.
+
+    実装は GPT-NeoX / vLLM 系で広く使われている slope 構成に準拠。
+    戻り値は shape=(num_heads,) の fp32 テンソル。
+    """
+    if num_heads <= 0:
+        raise ValueError(f"num_heads must be positive, got {num_heads}")
+    closest_power_of_2 = 2 ** math.floor(math.log2(num_heads))
+    base = torch.tensor(
+        2 ** (-(2 ** -(math.log2(closest_power_of_2) - 3))),
+        dtype=torch.float32,
+        device=device,
+    )
+    powers = torch.arange(1, 1 + closest_power_of_2, dtype=torch.int32, device=device)
+    slopes = torch.pow(base, powers)
+    if closest_power_of_2 != num_heads:
+        extra_base = torch.tensor(
+            2 ** (-(2 ** -(math.log2(2 * closest_power_of_2) - 3))),
+            dtype=torch.float32,
+            device=device,
+        )
+        num_remaining_heads = min(closest_power_of_2, num_heads - closest_power_of_2)
+        extra_powers = torch.arange(
+            start=1,
+            end=1 + 2 * num_remaining_heads,
+            step=2,
+            dtype=torch.int32,
+            device=device,
+        )
+        slopes = torch.cat([slopes, torch.pow(extra_base, extra_powers)], dim=0)
+    return slopes
+
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, dim: int, head_dim: int, num_heads: int, num_kv_heads: int, num_layers: int, layer_idx: int):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.num_heads = num_heads
+        self.n_kv_head = num_kv_heads
+        self.head_dim = head_dim
+        self.dim = dim
+        assert self.num_heads * self.head_dim == self.dim
+        assert self.n_kv_head <= self.num_heads and self.num_heads % self.n_kv_head == 0
+
+        self.c_q = nn.Linear(self.dim, self.num_heads * self.head_dim, bias=False)
+        self.c_k = nn.Linear(self.dim, self.n_kv_head * self.head_dim, bias=False)
+        self.c_v = nn.Linear(self.dim, self.n_kv_head * self.head_dim, bias=False)
+        self.c_proj = nn.Linear(self.dim, self.dim, bias=False)
+
+        self.ve_gate_channels = 32
+        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, num_layers) else None
+
+
+    def forward(self, x: Tensor, ve: Tensor, attn_args: AttnArgs):
+        B, T, _ = x.size()
+        assert B == 1, "varlen sequences requires B == 1"
+        assert T % 16 == 0
+
+        q = self.c_q(x).view(B, T, self.num_heads, self.head_dim)
+        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+
+        if ve is not None:
+            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
+            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
+            v = v + gate.unsqueeze(-1) * ve
+
+        cos = attn_args.cos[:, :T]
+        sin = attn_args.sin[:, :T]
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+        q, k = norm(q), norm(k)
+
+        max_len = args.train_max_seq_len if self.training else args.device_batch_size_tokens
+        if attn_args.alibi_slopes is not None and FLASH_ATTN_SUPPORTS_ALIBI_SLOPES:
+            y = _flash_attn_varlen_func(
+                q[0], k[0], v[0],
+                cu_seqlens_q=attn_args.seqlens, cu_seqlens_k=attn_args.seqlens,
+                max_seqlen_q=max_len, max_seqlen_k=max_len,
+                causal=True, softmax_scale=attn_args.attn_scale, window_size=attn_args.window_size,
+                alibi_slopes=attn_args.alibi_slopes,
+            )
+        else:
+            y = _flash_attn_varlen_func(
+                q[0], k[0], v[0],
+                cu_seqlens_q=attn_args.seqlens, cu_seqlens_k=attn_args.seqlens,
+                max_seqlen_q=max_len, max_seqlen_k=max_len,
+                causal=True, softmax_scale=attn_args.attn_scale, window_size=attn_args.window_size,
+            )
+        y = y.view(B, T, self.num_heads, self.head_dim)
+        y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
+        y = self.c_proj(y)
+        return y
+
+
+class MLP(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.c_fc = nn.Linear(dim, 4 * dim, bias=False)
+        self.c_proj = nn.Linear(4 * dim, dim, bias=False)
+
+    def forward(self, x: Tensor):
+        x = self.c_fc(x)
+        x = F.relu(x).square()
+        x = self.c_proj(x)
+        return x
+
+
+class Block(nn.Module):
+    def __init__(self, dim: int, head_dim: int, num_heads: int, num_kv_heads: int, num_layers: int, layer_idx: int):
+        super().__init__()
+        self.attn = CausalSelfAttention(dim, head_dim, num_heads, num_kv_heads, num_layers, layer_idx)
+        self.mlp = MLP(dim)
+
+    def forward(self, x: Tensor, ve: Tensor, attn_args: AttnArgs):
+        x = x + self.attn(norm(x), ve, attn_args)
+        x = x + self.mlp(norm(x))
+        return x
+
+
+# -----------------------------------------------------------------------------
+# The main model
+
+def next_multiple_of_n(v: float | int, *, n: int):
+    return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
+
+
+@dataclass
+class ForwardScheduleConfig:
+    ws_short: int
+    ws_long: int
+
+
+class GPT(nn.Module):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, num_kv_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
+        super().__init__()
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.model_dim = model_dim
+        self.max_seq_len = max_seq_len
+        assert self.num_kv_heads <= self.num_heads and self.num_heads % self.num_kv_heads == 0
+
+        self.vocab_size = vocab_size
+        self.padded_vocab_size = next_multiple_of_n(vocab_size, n=64)
+
+        self.transformer = nn.ModuleDict({
+            "wte": nn.Embedding(self.padded_vocab_size, model_dim),
+            "h": nn.ModuleList([Block(model_dim, head_dim, num_heads, num_kv_heads, num_layers, i) for i in range(num_layers)]),
+        })
+        self.lm_head = nn.Linear(model_dim, self.padded_vocab_size, bias=False)
+
+        # Per-layer scalars
+        self.resid_lambdas = nn.Parameter(torch.ones(num_layers))
+        self.x0_lambdas = nn.Parameter(torch.zeros(num_layers))
+
+        # Value embeddings (ResFormer-style): alternating layers, last layer always included
+        kv_dim = num_kv_heads * head_dim
+        self.value_embeds = nn.ModuleDict({
+            str(i): nn.Embedding(self.padded_vocab_size, kv_dim)
+            for i in range(num_layers) if has_ve(i, num_layers)
+        })
+
+        # YaRN scaling on top of nanochat RoPE + 4-axis MRoPE
+        # 軸の有効/無効は args.mrope_axes で切り替え可能（デフォルト: 全部有効）
+        enable_index, enable_bar, enable_pos, enable_pitch = parse_mrope_axes(getattr(args, "mrope_axes", None))
+        self.yarn = Yarn(
+            head_dim,
+            max_seq_len,
+            enable_index=enable_index,
+            enable_bar=enable_bar,
+            enable_pos=enable_pos,
+            enable_pitch=enable_pitch,
+        )
+
+        # Optional: ALiBi (FlashAttention-2) を使う場合は slopes を flash_attn_varlen_func に渡す
+        # - flash-attn のバージョンによっては alibi_slopes 引数が無いことがあるため、サポート有無を検出してから有効化
+        self.use_alibi = bool(getattr(args, "use_alibi", False)) and FLASH_ATTN_SUPPORTS_ALIBI_SLOPES
+        if bool(getattr(args, "use_alibi", False)) and (not FLASH_ATTN_SUPPORTS_ALIBI_SLOPES):
+            if "print0" in globals():
+                print0(
+                    "WARNING: args.use_alibi=True but flash_attn_varlen_func does not support alibi_slopes; ALiBi will be disabled.",
+                    console=True,
+                )
+        self.alibi_slopes = nn.Buffer(build_alibi_slopes(num_heads), persistent=False) if self.use_alibi else None
+
+        # nanochat-style window pattern (tiled across layers, final layer always long)
+        self.window_pattern = args.window_pattern.upper()
+        if not self.window_pattern or any(c not in "SL" for c in self.window_pattern):
+            raise ValueError(f"Invalid window_pattern: {args.window_pattern}. Use only S and L.")
+
+        self.init_weights()
+
+    @torch.no_grad()
+    def init_weights(self):
+        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
+        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+
+        s = (3 ** 0.5) * (self.model_dim ** -0.5)
+        for block in self.transformer.h:
+            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
+            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
+            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+            torch.nn.init.zeros_(block.attn.c_proj.weight)
+            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if block.attn.ve_gate is not None:
+                torch.nn.init.zeros_(block.attn.ve_gate.weight)
+
+        self.resid_lambdas.fill_(1.0)
+        self.x0_lambdas.fill_(0.0)
+
+        for ve in self.value_embeds.values():
+            torch.nn.init.uniform_(ve.weight, -s, s)
+
+    def setup_optimizers(
+        self,
+        unembedding_lr: float = 0.004,
+        embedding_lr: float = 0.2,
+        matrix_lr: float = 0.02,
+        weight_decay: float = 0.0,
+        adam_betas: tuple[float, float] = (0.8, 0.95),
+        scalar_lr: float = 0.5,
+    ):
+        model_dim = self.model_dim
+        ddp = dist.is_initialized()
+        # Separate out parameters into groups
+        matrix_params = list(self.transformer.h.parameters())
+        value_embeds_params = list(self.value_embeds.parameters())
+        embedding_params = list(self.transformer.wte.parameters())
+        lm_head_params = list(self.lm_head.parameters())
+        resid_params = [self.resid_lambdas]
+        x0_params = [self.x0_lambdas]
+        assert len(list(self.parameters())) == (
+            len(matrix_params) + len(embedding_params) + len(lm_head_params) +
+            len(value_embeds_params) + len(resid_params) + len(x0_params)
+        )
+        # AdamW optimizer for embedding, lm_head, and per-layer scalars
+        dmodel_lr_scale = (model_dim / 768) ** -0.5
+        print0(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
+        adam_groups = [
+            dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),
+            dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
+            dict(params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale),
+            dict(params=resid_params, lr=scalar_lr * 0.01),
+            dict(params=x0_params, lr=scalar_lr),
+        ]
+        adamw_kwargs = dict(betas=adam_betas, eps=1e-10, weight_decay=0.0)
+        AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
+        adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
+        # Muon optimizer for matrix parameters
+        muon_kwargs = dict(lr=matrix_lr, momentum=0.95, weight_decay=weight_decay)
+        MuonFactory = DistMuon if ddp else Muon
+        muon_optimizer = MuonFactory(matrix_params, **muon_kwargs)
+        optimizers = [adamw_optimizer, muon_optimizer]
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["initial_lr"] = group["lr"]
+        return optimizers
+
+    def _get_bm_sizes(self, ws_short: int, ws_long: int):
+        short_bm = ws_short * args.block_size
+        long_bm = ws_long * args.block_size
+        pattern = self.window_pattern
+        window_sizes = []
+        for layer_idx in range(self.num_layers):
+            char = pattern[layer_idx % len(pattern)]
+            window_sizes.append(long_bm if char == "L" else short_bm)
+        window_sizes[-1] = long_bm
+        return window_sizes
+
+    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, schedule_cfg: ForwardScheduleConfig):
+        assert input_seq.ndim == 1
+
+        ws_short, ws_long = schedule_cfg.ws_short, schedule_cfg.ws_long
+
+        B = 1
+        T = input_seq.size(0)
+        assert T <= self.yarn.max_seq_len, "sequence length exceeds rotary cache"
+
+        x = self.transformer.wte(input_seq)
+        x = norm(x)[None]
+        x0 = x
+
+        bm_sizes = self._get_bm_sizes(ws_short, ws_long)
+
+        # YaRN + 4-axis MRoPE: generate cos/sin once per sequence and share across layers
+        cos, sin = self.yarn(input_seq)
+
+        # Optional ALiBi (FlashAttention-2): slopes は fp32 を推奨
+        alibi_slopes = self.alibi_slopes if self.use_alibi else None
+        if alibi_slopes is not None and alibi_slopes.dtype != torch.float32:
+            alibi_slopes = alibi_slopes.float()
+
+        for i, block in enumerate(self.transformer.h):
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            ve = self.value_embeds[str(i)](input_seq) if str(i) in self.value_embeds else None
+            attn_args = AttnArgs(
+                seqlens=seqlens,
+                cos=cos,
+                sin=sin,
+                attn_scale=self.yarn.attn_scale,
+                window_size=(bm_sizes[i], 0),
+                alibi_slopes=alibi_slopes,
+            )
+            x = block(x, ve, attn_args)
+        x = norm(x)
+
+        softcap = 15.0
+
+        if not self.training:
+            loss = 0.0
+            x_flat = x.flatten(end_dim=1)
+            x_chunks = x_flat.chunk(4)
+            t_chunks = target_seq.chunk(4)
+            for x_chunk, t_chunk in zip(x_chunks, t_chunks):
+                logits = F.linear(x_chunk, self.lm_head.weight).float()
+                logits = logits[:, :self.vocab_size]
+                logits = softcap * torch.tanh(logits / softcap)
+                loss += F.cross_entropy(logits, t_chunk, reduction="mean") / 4
+            return loss
+
+        logits = self.lm_head(x)
+        logits = logits[..., :self.vocab_size]
+        logits = logits.float()
+        logits = softcap * torch.tanh(logits / softcap)
+        logits_for_loss = logits
+        loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="mean")
+        return loss
+# -----------------------------------------------------------------------------
+# Distributed data loader
+
+def _load_data_shard(file: Path):
+    header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
+    assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+    assert header[1] == 1, "unsupported version"
+    num_tokens = int(header[2]) # number of tokens (claimed)
+    with file.open("rb", buffering=0) as f:
+        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True) # avoid pin_memory copy by @YouJiacheng
+        f.seek(256 * 4)
+        nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy by @YouJiacheng
+        assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
+    return tokens
+
+BOS_ID = 161
+
+class BOSFinder:
+    # Helper for getting sequences that start at the beginning of documents by @varunneal based on work by @classiclarryd
+    def __init__(self, tokens: Tensor, world_size: int = 1, quickload: bool = False):
+        # Precompute BOS positions once per shard
+        self.tokens=tokens
+        self.size = tokens.numel()
+        self.quickload = quickload
+        if quickload:
+            # only scan first 4 million tokens, then kickoff async thread to scan rest
+            self.bos_idx = (tokens[:4_000_000] == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+            self.thread = None
+            self.ready = threading.Event()
+            self.start()
+        else:
+            self.bos_idx = (tokens == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+        self.i = 0
+        self.world_size = world_size
+        self.batch_iter = 0
+
+    def _load(self):
+        self.bos_idx_async = (self.tokens == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+        self.ready.set()
+
+    def start(self):
+        self.ready.clear()
+        self.thread = threading.Thread(target=self._load)
+        self.thread.start()
+
+    def get(self):
+        if self.thread:
+            self.ready.wait()
+            self.thread.join()
+        self.bos_idx = self.bos_idx_async
+
+    def next_batch(self, num_tokens_local: int, max_seq_len: int):
+        # if quickload was used, repoint to the full dataset after 5 batches
+        if self.quickload and self.batch_iter==5:
+            self.get()
+        n = len(self.bos_idx)
+        starts = [[] for _ in range(self.world_size)]
+        ends = [[] for _ in range(self.world_size)]
+
+        idx = self.i
+        for r in range(self.world_size):
+            cur_len = 0
+            while cur_len <= num_tokens_local:
+                if idx >= n:
+                    raise StopIteration(f"Insufficient BOS ahead; hit tail of shard.")
+                cur = self.bos_idx[idx]
+                starts[r].append(cur)
+                end = min(self.bos_idx[idx + 1] if idx + 1 < n else self.size,
+                          cur + max_seq_len,
+                          cur + num_tokens_local - cur_len + 1)
+                ends[r].append(end)
+                cur_len += end - cur
+                idx += 1
+
+            assert cur_len == num_tokens_local + 1
+        self.i = idx
+        self.batch_iter+=1
+        return starts, ends
+
+class DataPreloader:
+    # Helper for asynchronously loading next shard and indexing bos tokens
+    def __init__(self, file_iter, world_size: int = 1):
+        self.file_iter = file_iter
+        self.world_size = world_size
+        self.thread = None
+        self.data = None
+        self.ready = threading.Event()
+
+    def _load(self):
+        tokens = _load_data_shard(next(self.file_iter))
+        self.data = (tokens, BOSFinder(tokens, self.world_size))
+        self.ready.set()
+
+    def start(self):
+        self.ready.clear()
+        self.thread = threading.Thread(target=self._load)
+        self.thread.start()
+
+    def get(self):
+        if self.thread:
+            self.ready.wait()
+            self.thread.join()
+        return self.data
+
+def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, grad_accum_steps: int = 1, align_to_bos: bool = True):
+    # align_to_bos: each sequence begins with Beginning of Sequence token, sequences truncated to max_seq_len
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    assert num_tokens % (world_size * grad_accum_steps) == 0, "Batch size must be divisible by world size"
+    num_tokens = num_tokens // grad_accum_steps
+
+    files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
+    if not files:
+        raise FileNotFoundError(f"No files found for pattern: {filename_pattern}")
+
+    file_iter = cycle(files) if len(files) == 1 else iter(files)
+    tokens = _load_data_shard(next(file_iter))
+    if align_to_bos:
+        finder = BOSFinder(tokens, world_size=world_size, quickload=True)
+        preloader = DataPreloader(file_iter, world_size)
+        preloader.start()
+    else:
+        pos = 0  # for unaligned case
+
+    while True:
+        num_tokens_local = num_tokens // world_size
+        max_num_docs = next_multiple_of_n(num_tokens_local // 300, n=128)  # median doc length is ~400
+
+        if align_to_bos:
+            try:
+                seq_starts, seq_ends = finder.next_batch(num_tokens_local, max_seq_len)
+                start_idxs, end_idxs = torch.tensor(seq_starts[rank]), torch.tensor(seq_ends[rank])
+            except StopIteration:
+                # This shard is exhausted, load the next one in the next loop iteration.
+                tokens, finder = preloader.get()
+                preloader.start()
+                continue
+
+            buf = torch.cat([tokens[i:j] for i, j in zip(start_idxs, end_idxs)])
+            _inputs = buf[:-1]
+            _targets = buf[1:]
+            end_idxs[-1] -= 1  # last document was too long to account for _targets offset
+            cum_lengths = (end_idxs - start_idxs).cumsum(0)
+
+        else:
+            if pos + num_tokens + 1 >= len(tokens):  # should not occur for val data
+                tokens, pos = _load_data_shard(next(file_iter)), 0
+
+            pos_local = pos + rank * num_tokens_local
+            buf = tokens[pos_local: pos_local + num_tokens_local + 1]
+            _inputs = buf[:-1].view(num_tokens_local, )
+            _targets = buf[1:].view(num_tokens_local, )
+
+            cum_lengths = torch.nonzero(_inputs == BOS_ID)[:, 0]
+            pos += num_tokens
+
+
+        _cum_lengths = torch.full((max_num_docs,), num_tokens_local)
+        _cum_lengths[0] = 0
+        _cum_lengths[1:len(cum_lengths) + 1] = cum_lengths
+
+        # Cast to int32 on CPU before transfer to avoid dtype conversion during .to()
+        _inputs = _inputs.to(dtype=torch.int32)
+        _targets = _targets.to(dtype=torch.int64)
+        _cum_lengths = _cum_lengths.to(dtype=torch.int32)
+
+        new_params = yield (
+            _inputs.to(device="cuda", non_blocking=True),
+            _targets.to(device="cuda", non_blocking=True),
+            _cum_lengths.to(device="cuda", non_blocking=True)
+        )
+
+        if new_params is not None:
+            # makes it possible for generator to receive new (num_tokens, max_seq_len, grad_accum_steps) via .send()
+            new_num_tokens, new_max_seq_len, new_grad_accum_steps = new_params
+            assert new_num_tokens % (world_size * new_grad_accum_steps) == 0, "Num tokens must be divisible by world size"
+            num_tokens = new_num_tokens // new_grad_accum_steps
+            max_seq_len = new_max_seq_len
+
+# -----------------------------------------------------------------------------
+# Training Management
+
+def get_bs(step: int):
+    if step >= args.num_scheduled_iterations:
+        return args.train_bs_extension
+    x = step / args.num_scheduled_iterations
+    bs_idx = int(len(args.train_bs_schedule) * x)
+    return args.train_bs_schedule[bs_idx]
+
+def get_ws(step: int):
+    # set short window size to half of long window size
+    # Higher ws on "extension" steps
+    if step >= args.num_scheduled_iterations:
+        return args.ws_final // 2, args.ws_final
+    x = step / args.num_scheduled_iterations
+    assert 0 <= x < 1
+    ws_idx = int(len(args.ws_schedule) * x)
+    return args.ws_schedule[ws_idx] // 2, args.ws_schedule[ws_idx]
+
+# learning rate schedule: nanochat warmup/warmdown
+def get_lr(step: int):
+    warmup_iters = round(args.warmup_ratio * args.num_iterations)
+    warmdown_iters = round(args.warmdown_ratio * args.num_iterations)
+    if warmup_iters > 0 and step < warmup_iters:
+        return (step + 1) / warmup_iters
+    if warmdown_iters == 0 or step <= args.num_iterations - warmdown_iters:
+        return 1.0
+    progress = (args.num_iterations - step) / warmdown_iters
+    return progress * 1.0 + (1 - progress) * args.final_lr_frac
+
+def get_muon_momentum(step: int, muon_warmup_steps=300, momentum_min=0.85, momentum_max=0.95):
+    # warmup phase: linearly increase momentum from min to max
+    frac = min(step / muon_warmup_steps, 1.0)
+    return momentum_min + frac * (momentum_max - momentum_min)
+
+def get_weight_decay(step: int, weight_decay_scaled: float):
+    # linear decay to zero over the course of training
+    progress = step / max(args.num_iterations, 1)
+    return weight_decay_scaled * (1 - progress)
+
+class TrainingManager():
+    """
+    Manages two optimizers (AdamW for embeddings/lm_head/scalars, Muon for matrices).
+    Notable Features:
+        1. AdamW + Muon split matches nanochat optimizer design
+        2. Learning rates follow nanochat warmup/warmdown schedule
+        3. Muon momentum warmup and linear weight decay schedule
+        4. Embed/lm_head are untied (nanochat-style)
+
+    Manages model architecture, data, and target that changes during training   
+    Notable Features:
+        1. Sliding Attention window schedule of [1,3] -> [3,7] -> [5,11] -> [6,13]
+        2. YaRN updates to RoPE on window changes
+        3. Untied embed and lm_head (nanochat-style)
+        4. Token-based batch size schedule via train_bs_schedule
+        5. Post training extension of long windows from 13 to 20
+    """
+    def __init__(self, model):
+        self.model = model
+
+        self.reference_batch_size = args.reference_batch_size
+        self.weight_decay_scaled = args.weight_decay * (12 / model.num_layers) ** 2
+        if model.num_layers != 12:
+            print0(f"Scaling weight decay from {args.weight_decay:.6f} to {self.weight_decay_scaled:.6f} for depth {model.num_layers}")
+
+        adam_betas = (args.adam_beta1, args.adam_beta2)
+        self.optimizers = model.setup_optimizers(
+            unembedding_lr=args.unembedding_lr,
+            embedding_lr=args.embedding_lr,
+            matrix_lr=args.matrix_lr,
+            weight_decay=self.weight_decay_scaled,
+            adam_betas=adam_betas,
+            scalar_lr=args.scalar_lr,
+        )
+        self.adamw_opt, self.muon_opt = self.optimizers
+
+        self.reset()
+
+    def apply_final_ws_ext(self):
+        new_ws_long = args.ws_validate_post_yarn_ext
+        if new_ws_long != self.ws_long:
+            self.model.yarn.apply(self.ws_long, new_ws_long)
+            self.ws_long = new_ws_long
+        self.ws_short = self.ws_long // 2
+
+    def get_forward_args(self):
+        return ForwardScheduleConfig(
+            ws_short = self.ws_short,
+            ws_long = self.ws_long
+        )
+    
+    def get_transition_steps(self):
+        transition_steps = [0]
+        ws_short, ws_long = get_ws(0)
+        for step in range(1, args.num_iterations):
+            ws_short, new_ws_long = get_ws(step)
+            if new_ws_long != ws_long:
+                transition_steps.append(step)
+                ws_long = new_ws_long
+        return transition_steps
+
+    def advance_schedule(self, step: int):
+        self.ws_short, new_ws_long = get_ws(step)
+        if new_ws_long != self.ws_long:
+            self.model.yarn.apply(self.ws_long, new_ws_long)
+
+        new_batch_size = get_bs(step)
+        if new_batch_size != self.batch_size:
+            new_grad_accum_steps = compute_grad_accum_steps(new_batch_size)
+            batch_ratio = new_batch_size / self.reference_batch_size
+            self.batch_lr_scale = batch_ratio ** 0.5 if batch_ratio != 1.0 else 1.0
+            print0(
+                f"Scaling LRs by {self.batch_lr_scale:.4f} for batch size {new_batch_size:,} "
+                f"(reference: {self.reference_batch_size:,})"
+            )
+            self.train_loader_send_args = (new_batch_size, args.train_max_seq_len, new_grad_accum_steps)
+            self.grad_accum_steps = new_grad_accum_steps
+            self.batch_size = new_batch_size
+        else:
+            self.train_loader_send_args = None
+
+        self.ws_long = new_ws_long
+
+    def step_optimizers(self, step: int):
+        step_lr = get_lr(step)
+        muon_momentum = get_muon_momentum(step)
+        muon_weight_decay = get_weight_decay(step, self.weight_decay_scaled)
+        for group in self.muon_opt.param_groups:
+            group["momentum"] = muon_momentum
+            group["weight_decay"] = muon_weight_decay
+
+        for opt in self.optimizers:
+            for group in opt.param_groups:
+                group["lr"] = group["initial_lr"] * self.batch_lr_scale * step_lr
+            opt.step()
+        self.model.zero_grad(set_to_none=True)
+
+    def reset(self, state=None):
+        if state is not None:
+            for opt, opt_state in zip(self.optimizers, state):
+                opt.load_state_dict(opt_state)
+
+        # muon momentum buffers not in state dict
+        self.muon_opt.reset()
+
+        self.ws_short, self.ws_long = get_ws(0)
+        self.batch_size = get_bs(0)
+        self.grad_accum_steps = compute_grad_accum_steps(self.batch_size)
+        batch_ratio = self.batch_size / self.reference_batch_size
+        self.batch_lr_scale = batch_ratio ** 0.5 if batch_ratio != 1.0 else 1.0
+        self.model.yarn.reset()
+
+    def get_state(self):
+        return [copy.deepcopy(opt.state_dict()) for opt in self.optimizers]
+
+# -----------------------------------------------------------------------------
+# int main
+
+@dataclass
+class Hyperparameters:
+    # data
+    train_files: str = "train.bin" # input .bin to train on
+    val_files: str = "val.bin" # input .bin to eval validation loss on
+    val_tokens: int = 32 * 2048 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    # batch sizes
+    train_bs_schedule: tuple = (4 * 2048, 4 * 2048, 8 * 2048, 8 * 2048, 
+                                32 * 2048, 32 * 2048, 32 * 2048, 32 * 2048,
+                                32 * 2048, 32 * 2048, 32 * 2048, 32 * 2048
+                               )
+    train_bs_extension: int = 32 * 2048
+    train_max_seq_len: int = 128 * 16 * 2 # doubled to enable longer window sizes
+    val_batch_size: int = 32 * 2048
+    device_batch_size_tokens: int = train_max_seq_len  # per-rank sequence length (varlen B==1)
+    reference_batch_size: int = 2**19
+    # optimization
+    unembedding_lr: float = 0.004
+    embedding_lr: float = 0.3
+    matrix_lr: float = 0.02
+    scalar_lr: float = 0.5
+    weight_decay: float = 0.2
+    adam_beta1: float = 0.8
+    adam_beta2: float = 0.95
+    num_scheduled_iterations: int = 4700  # number of steps to complete ws schedule
+    num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
+    num_iterations: int = num_scheduled_iterations + num_extension_iterations   
+    # nanochat-style LR schedule
+    warmup_ratio: float = 0.0
+    warmdown_ratio: float = 0.6
+    final_lr_frac: float = 0.0
+    # evaluation and logging
+    run_id: str = f"{uuid.uuid4()}"
+    val_loss_every: int = 100  # every how many steps to evaluate val loss? 0 for only at the end
+    save_checkpoint: bool = False
+    # attention masking
+    block_size: int = 128
+    window_pattern: str = "SSSL"
+    ws_schedule: tuple = (1, 7, 11, 15,
+                          19, 23, 23, 23,
+                          23, 23, 23, 23)
+    ws_final: int = 23 # set final validation ws, used for YaRN extension and short window size
+    ws_validate_post_yarn_ext: int = 27 # extend long windows out even further after applying YaRN
+    # model (GQA) - 0 means use num_heads (GQA disabled, nanochat default)
+    num_kv_heads: int = 0
+
+    # positional encoding
+    # - mrope_axes: "index,bar,pos,pitch" / "index,pos" / "none" / "all" など
+    # - use_alibi: FlashAttention-2 の alibi_slopes を使って ALiBi を有効化（RoPE と併用も可）
+    mrope_axes: str = "index,bar,pos,pitch"
+    use_alibi: bool = False
+
+args = Hyperparameters()
+
+data_path = os.environ.get("DATA_PATH", ".")
+args.train_files = os.path.join(data_path, args.train_files)
+args.val_files = os.path.join(data_path, args.val_files)
+args.total_batch_size_tokens = args.train_bs_schedule[0]
+
+# torchrun sets these env variables
+rank = int(os.environ["RANK"])
+world_size = int(os.environ["WORLD_SIZE"])
+tokens_per_fwdbwd = args.device_batch_size_tokens
+world_tokens_per_fwdbwd = tokens_per_fwdbwd * world_size
+
+def compute_grad_accum_steps(total_tokens: int) -> int:
+    assert total_tokens % world_tokens_per_fwdbwd == 0, (
+        "Total batch size must be divisible by device batch tokens * world size"
+    )
+    return total_tokens // world_tokens_per_fwdbwd
+
+grad_accum_steps = compute_grad_accum_steps(args.total_batch_size_tokens)
+val_grad_accum_steps = compute_grad_accum_steps(args.val_batch_size)
+assert args.device_batch_size_tokens <= args.train_max_seq_len, "device_batch_size_tokens must be <= train_max_seq_len"
+assert args.device_batch_size_tokens % 16 == 0, (
+    "device_batch_size_tokens must be a multiple of 16 (flash_attn varlen requirement)"
+)
+max_ws = max(args.ws_schedule + (args.ws_final, args.ws_validate_post_yarn_ext))
+max_window_tokens = max_ws * args.block_size
+assert args.device_batch_size_tokens >= max_window_tokens, (
+    f"device_batch_size_tokens ({args.device_batch_size_tokens}) must cover max window "
+    f"{max_ws} * block_size {args.block_size} = {max_window_tokens}"
+)
+
+# Validate batch sizes for all scheduled steps up-front
+_all_train_bs = list(args.train_bs_schedule) + [args.train_bs_extension]
+for bs in _all_train_bs + [args.val_batch_size]:
+    assert bs % world_tokens_per_fwdbwd == 0, (
+        f"Batch size {bs} must be divisible by device_batch_size_tokens * world_size "
+        f"({world_tokens_per_fwdbwd})"
+    )
+assert torch.cuda.is_available()
+device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+torch.cuda.set_device(device)
+dist.init_process_group(backend="nccl", device_id=device)
+dist.barrier()
+master_process = (rank == 0) # this process will do logging, checkpointing etc.
+
+# begin logging
+logfile = None
+if master_process:
+    run_id = args.run_id
+    os.makedirs("logs", exist_ok=True)
+    logfile = f"logs/{run_id}.txt"
+    print(logfile)
+def print0(s, console=False):
+    if master_process:
+        with open(logfile, "a") as f:
+            if console:
+                print(s)
+            print(s, file=f)
+
+# begin by printing this file (the Python code)
+print0(code)
+print0("="*100)
+# log information about the hardware/software environment this is running on
+print0(f"Running Python {sys.version}")
+print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
+
+def nvidia_smi():
+    import subprocess  # avoid top level import
+    return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
+print0(nvidia_smi())
+print0("="*100)
+print0(f"Tokens / micro-batch / rank: {tokens_per_fwdbwd:,}")
+print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
+print0(f"Total batch size {args.total_batch_size_tokens:,} => gradient accumulation steps: {grad_accum_steps}")
+
+autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+
+num_layers = 16
+num_heads = 8
+head_dim = 128
+model_dim = 1024
+model: nn.Module = GPT(
+    vocab_size=164,
+    num_layers=num_layers,
+    num_heads=num_heads,
+    num_kv_heads=(args.num_kv_heads or num_heads),
+    head_dim=head_dim,
+    model_dim=model_dim,
+    max_seq_len=args.train_max_seq_len
+).cuda()
+if model.transformer.wte.weight.device.type == "cuda":
+    model.transformer.wte.to(dtype=torch.bfloat16)
+    for ve in model.value_embeds.values():
+        ve.to(dtype=torch.bfloat16)
+for param in model.parameters():
+    dist.broadcast(param.detach(), 0)
+
+#model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+model: nn.Module = model
+training_manager = TrainingManager(model)
+
+########################################
+#        Training and validation       #
+########################################
+train_loader = distributed_data_generator(args.train_files, args.train_bs_schedule[0], args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
+
+gc.collect()
+
+training_time_ms = 0
+# start the clock
+torch.cuda.synchronize()
+t0 = time.perf_counter()
+# begin training
+train_steps = args.num_iterations
+for step in range(train_steps + 1):
+    last_step = (step == train_steps)
+    training_manager.advance_schedule(step)
+    # --------------- VALIDATION SECTION -----------------
+    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+        if last_step:
+            training_manager.apply_final_ws_ext()
+        # stop the clock
+        torch.cuda.synchronize()
+        training_time_ms += 1000 * (time.perf_counter() - t0)
+        model.eval()
+        val_batches = math.ceil(args.val_tokens / args.val_batch_size)
+        val_tokens_effective = val_batches * args.val_batch_size
+        if val_tokens_effective != args.val_tokens:
+            print0(
+                f"val_tokens rounded up from {args.val_tokens:,} to {val_tokens_effective:,} "
+                f"to fit val_batch_size {args.val_batch_size:,}",
+                console=True,
+            )
+        val_steps = val_batches * val_grad_accum_steps
+        val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=val_grad_accum_steps, align_to_bos=False)
+        val_loss = 0
+        with torch.no_grad():
+            for _ in range(val_steps):
+                inputs, targets, cum_seqlens = next(val_loader)
+                with autocast_ctx:
+                    val_loss += model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
+        val_loss /= val_steps
+        del val_loader
+        dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        model.train()
+        # start the clock again
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+
+    if last_step:
+        if master_process and args.save_checkpoint:
+            log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in training_manager.optimizers])
+            os.makedirs(f"logs/{run_id}", exist_ok=True)
+            torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
+        # the last step only has the validation loop, so break to avoid training
+        break
+
+    # --------------- TRAINING SECTION -----------------
+    for idx in range(training_manager.grad_accum_steps):
+        send_args = training_manager.train_loader_send_args
+        inputs, targets, cum_seqlens = train_loader.send(send_args)
+        with autocast_ctx:
+            (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / training_manager.grad_accum_steps).backward()
+    training_manager.step_optimizers(step)
+
+    # logging
+    approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
+    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+
+print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+       f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+dist.destroy_process_group()
