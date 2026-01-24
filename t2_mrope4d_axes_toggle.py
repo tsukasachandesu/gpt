@@ -537,7 +537,7 @@ class Yarn(nn.Module):
         pos_start: int = 97,
         pos_size: int = 32,
         # doc 境界（BOS=129 が既定。None で無効化）
-        doc_id: int | None = 161,
+        doc_id: int | None = 129,
         # pitch/pos の forward-fill と reset 条件
         carry_pitch: bool = True,
         reset_pitch_on_pos: bool = True,
