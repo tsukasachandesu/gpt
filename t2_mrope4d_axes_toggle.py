@@ -532,11 +532,11 @@ class Yarn(nn.Module):
         *,
         # token ID 設定（本コードベースのデフォルト語彙に合わせる）
         pitch_start: int = 0,
-        pitch_size: int = 128,
-        bar_id: int | None = 128,
-        pos_start: int = 129,
+        pitch_size: int = 96,
+        bar_id: int | None = 96,
+        pos_start: int = 97,
         pos_size: int = 32,
-        # doc 境界（BOS=161 が既定。None で無効化）
+        # doc 境界（BOS=129 が既定。None で無効化）
         doc_id: int | None = 161,
         # pitch/pos の forward-fill と reset 条件
         carry_pitch: bool = True,
@@ -1166,7 +1166,7 @@ def _load_data_shard(file: Path):
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
     return tokens
 
-BOS_ID = 161
+BOS_ID = 129
 
 class BOSFinder:
     # Helper for getting sequences that start at the beginning of documents by @varunneal based on work by @classiclarryd
@@ -1617,8 +1617,10 @@ num_layers = 16
 num_heads = 8
 head_dim = 128
 model_dim = 1024
+vocab_size = 132
+
 model: nn.Module = GPT(
-    vocab_size=164,
+    vocab_size=vocab_size,
     num_layers=num_layers,
     num_heads=num_heads,
     num_kv_heads=(args.num_kv_heads or num_heads),
