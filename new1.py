@@ -1959,13 +1959,13 @@ class Hyperparameters:
     val_files: str = "val.bin" # input .bin to eval validation loss on
     val_tokens: int = 32 * 2048 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
-    train_bs_schedule: tuple = (4 * 2048, 4 * 2048, 8 * 2048, 8 * 2048, 
-                                32 * 2048, 32 * 2048, 32 * 2048, 32 * 2048,
-                                32 * 2048, 32 * 2048, 32 * 2048, 32 * 2048
+    train_bs_schedule: tuple = (32 * 2048, 32 * 2048, 32 * 2048, 32 * 2048, 
+                                64 * 2048, 64 * 2048, 64 * 2048, 64 * 2048,
+                                64 * 2048, 64 * 2048, 64 * 2048, 64 * 2048
                                )
-    train_bs_extension: int = 32 * 2048
-    train_max_seq_len: int = 128 * 16 * 2 # doubled to enable longer window sizes
-    val_batch_size: int = 32 * 2048
+    train_bs_extension: int = 64 * 2048
+    train_max_seq_len: int = 4 * 2048 # doubled to enable longer window sizes
+    val_batch_size: int = 64 * 2048
     device_batch_size_tokens: int = train_max_seq_len  # per-rank sequence length (varlen B==1)
     reference_batch_size: int = 2**19
     # optimization
@@ -1976,8 +1976,8 @@ class Hyperparameters:
     weight_decay: float = 0.2
     adam_beta1: float = 0.8
     adam_beta2: float = 0.95
-    num_scheduled_iterations: int = 4700  # number of steps to complete ws schedule
-    num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
+    num_scheduled_iterations: int = 2000  # number of steps to complete ws schedule
+    num_extension_iterations: int = 300  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations   
     # nanochat-style LR schedule
     warmup_ratio: float = 0.0
@@ -1986,9 +1986,9 @@ class Hyperparameters:
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 100  # every how many steps to evaluate val loss? 0 for only at the end
-    save_checkpoint: bool = False
+    save_checkpoint: bool = True
     # checkpointing / resume
-    save_every: int = 0  # (steps) 0 disables periodic checkpoints (keeps legacy behavior)
+    save_every: int = 500  # (steps) 0 disables periodic checkpoints (keeps legacy behavior)
     checkpoint_dir: str = ""  # "" -> logs/{run_id}
     resume: bool = False
     resume_step: int = -1  # -1 -> latest
@@ -1999,7 +1999,7 @@ class Hyperparameters:
                           19, 23, 23, 23,
                           23, 23, 23, 23)
     ws_final: int = 23 # set final validation ws, used for YaRN extension and short window size
-    ws_validate_post_yarn_ext: int = 27 # extend long windows out even further after applying YaRN
+    ws_validate_post_yarn_ext: int = 23 # extend long windows out even further after applying YaRN
     # model (GQA) - 0 means use num_heads (GQA disabled, nanochat default)
     num_kv_heads: int = 0
 
@@ -2015,7 +2015,6 @@ args.total_batch_size_tokens = args.train_bs_schedule[0]
 # -----------------------------------------------------------------------------
 from typing import Optional, Sequence, Tuple
 import inspect
-
 
 class KVCache:
     """Per-layer KV cache for FlashAttention kv-cache inference.
