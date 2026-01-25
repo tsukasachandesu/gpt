@@ -1567,7 +1567,7 @@ class Hyperparameters:
     num_kv_heads: int = 0
 
     # vocabulary
-    vocab_size: int = 164
+    vocab_size: int = 132
 
     # Bigram hash embedding (PR #201):
     # - computed hash id range: [0, bigram_vocab_size - 2]
