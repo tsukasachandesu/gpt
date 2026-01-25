@@ -542,12 +542,12 @@ class Yarn(nn.Module):
         *,
         # token ID 設定（本コードベースのデフォルト語彙に合わせる）
         pitch_start: int = 0,
-        pitch_size: int = 128,
-        bar_id: int | None = 128,
-        pos_start: int = 129,
+        pitch_size: int = 96,
+        bar_id: int | None = 96,
+        pos_start: int = 97,
         pos_size: int = 32,
-        # doc 境界（BOS=161 が既定。None で無効化）
-        doc_id: int | None = 161,
+        # doc 境界（BOS=129 が既定。None で無効化）
+        doc_id: int | None = 129,
         # pitch/pos の forward-fill と reset 条件
         carry_pitch: bool = True,
         reset_pitch_on_pos: bool = True,
@@ -1188,7 +1188,7 @@ def _load_data_shard(file: Path):
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
     return tokens
 
-BOS_ID = 161
+BOS_ID = 129
 
 class BOSFinder:
     # Helper for getting sequences that start at the beginning of documents by @varunneal based on work by @classiclarryd
@@ -2789,9 +2789,9 @@ def _run_inference_cli():
     tokens_model = tokens_model[sl]
 
     # Ensure minimal valid prefix for decoding & YaRN resets
-    BOS_ID = 161
-    BAR_ID_MODEL = 128
-    POS0_ID_MODEL = 129  # pos=0 with offset=129
+    BOS_ID = 129
+    BAR_ID_MODEL = 96
+    POS0_ID_MODEL = 97 # pos=0 with offset=129
     tokens_model = _ensure_bos_bar_pos0(tokens_model, bos_id=BOS_ID, bar_id=BAR_ID_MODEL, pos0_id=POS0_ID_MODEL)
 
     # Resolve checkpoint paths
@@ -2810,7 +2810,7 @@ def _run_inference_cli():
     state_dict = _strip_state_dict_prefixes(state_dict)
 
     # Model hyperparams (must match training)
-    vocab_size = 164
+    vocab_size = 132
     head_dim = 128  # must match training; used for RoPE + attention reshape
 
     # Derive num_layers from checkpoint if possible (robust to config tweaks)
