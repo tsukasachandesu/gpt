@@ -1876,9 +1876,9 @@ class Hyperparameters:
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 100  # every how many steps to evaluate val loss? 0 for only at the end
-    save_checkpoint: bool = False
+    save_checkpoint: bool = True
     # checkpointing / resume
-    save_every: int = 0  # (steps) 0 disables periodic checkpoints (keeps legacy behavior)
+    save_every: int = 1000  # (steps) 0 disables periodic checkpoints (keeps legacy behavior)
     checkpoint_dir: str = ""  # "" -> logs/{run_id}
     resume: bool = False
     resume_step: int = -1  # -1 -> latest
