@@ -532,9 +532,9 @@ class Yarn(nn.Module):
         *,
         # token ID 設定（本コードベースのデフォルト語彙に合わせる）
         pitch_start: int = 0,
-        pitch_size: int = 128,
-        bar_id: int | None = 128,
-        pos_start: int = 129,
+        pitch_size: int = 96,
+        bar_id: int | None = 96,
+        pos_start: int = 97,
         pos_size: int = 32,
         # doc 境界（BOS=129 が既定。None で無効化）
         doc_id: int | None = 129,
