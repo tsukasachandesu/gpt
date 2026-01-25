@@ -1959,11 +1959,11 @@ class Hyperparameters:
     val_files: str = "val.bin" # input .bin to eval validation loss on
     val_tokens: int = 32 * 2048 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
-    train_bs_schedule: tuple = (32 * 2048, 32 * 2048, 32 * 2048, 32 * 2048, 
-                                64 * 2048, 64 * 2048, 64 * 2048, 64 * 2048,
-                                64 * 2048, 64 * 2048, 64 * 2048, 64 * 2048
+    train_bs_schedule: tuple = (8 * 2048, 16 * 2048, 32 * 2048, 32 * 2048, 
+                                64 * 2048, 64 * 2048, 128 * 2048, 128 * 2048,
+                                128 * 2048, 128 * 2048, 256 * 2048, 256 * 2048
                                )
-    train_bs_extension: int = 64 * 2048
+    train_bs_extension: int = 256 * 2048
     train_max_seq_len: int = 4 * 2048 # doubled to enable longer window sizes
     val_batch_size: int = 64 * 2048
     device_batch_size_tokens: int = train_max_seq_len  # per-rank sequence length (varlen B==1)
@@ -1976,7 +1976,7 @@ class Hyperparameters:
     weight_decay: float = 0.2
     adam_beta1: float = 0.8
     adam_beta2: float = 0.95
-    num_scheduled_iterations: int = 2000  # number of steps to complete ws schedule
+    num_scheduled_iterations: int = 3000  # number of steps to complete ws schedule
     num_extension_iterations: int = 300  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations   
     # nanochat-style LR schedule
@@ -1989,17 +1989,17 @@ class Hyperparameters:
     save_checkpoint: bool = True
     # checkpointing / resume
     save_every: int = 500  # (steps) 0 disables periodic checkpoints (keeps legacy behavior)
-    checkpoint_dir: str = ""  # "" -> logs/{run_id}
-    resume: bool = False
+    checkpoint_dir: str = "/content/gpt/logs/a706b1d6-7819-4262-a97c-191c4f1f7707/"  # "" -> logs/{run_id}
+    resume: bool = True
     resume_step: int = -1  # -1 -> latest
     # attention masking
     block_size: int = 128
     window_pattern: str = "SSSL"
     ws_schedule: tuple = (1, 7, 11, 15,
                           19, 23, 23, 23,
-                          23, 23, 23, 23)
-    ws_final: int = 23 # set final validation ws, used for YaRN extension and short window size
-    ws_validate_post_yarn_ext: int = 23 # extend long windows out even further after applying YaRN
+                          27, 27, 27, 27)
+    ws_final: int = 27 # set final validation ws, used for YaRN extension and short window size
+    ws_validate_post_yarn_ext: int = 27 # extend long windows out even further after applying YaRN
     # model (GQA) - 0 means use num_heads (GQA disabled, nanochat default)
     num_kv_heads: int = 0
 
