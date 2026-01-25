@@ -2918,7 +2918,7 @@ def _run_inference_cli():
         allowed[128:vocab_size] = True           # BAR/POS/BOS/EOF/PAD
         if int(a.disallow_bos_pad) == 1:
             allowed[BOS_ID] = False
-            allowed[163] = False  # PAD
+            allowed[131] = False  # PAD
         allowed_mask = allowed
     elif int(a.disallow_bos_pad) == 1:
         allowed = torch.ones((vocab_size,), device=device, dtype=torch.bool)
