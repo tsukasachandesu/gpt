@@ -1989,7 +1989,7 @@ class Hyperparameters:
     save_checkpoint: bool = True
     # checkpointing / resume
     save_every: int = 500  # (steps) 0 disables periodic checkpoints (keeps legacy behavior)
-    checkpoint_dir: str = "/content/gpt/logs/a706b1d6-7819-4262-a97c-191c4f1f7707/"  # "" -> logs/{run_id}
+    checkpoint_dir: str = "/content/drive/MyDrive/5"  # "" -> logs/{run_id}
     resume: bool = True
     resume_step: int = -1  # -1 -> latest
     # attention masking
