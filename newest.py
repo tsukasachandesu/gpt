@@ -537,7 +537,6 @@ def norm(x: Tensor):
 # * Interleaved-MRoPE compatible (fixed stride overwrite; stride = number of axes)
 # * half-truncate RoPE is NOT used here (full rotary frequencies)
 
-
 def forward_fill_from_updates(updates: Tensor, update_mask: Tensor, idx: Tensor) -> Tensor:
     """Forward-fill (last observation carried forward).
 
@@ -2267,11 +2266,11 @@ class Hyperparameters:
     val_files: str = "val.bin" # input .bin to eval validation loss on
     val_tokens: int = 32 * 2048 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
-    train_bs_schedule: tuple = (256 * 2048,256 * 2048)
-    train_bs_extension: int = 256 * 2048
-    train_max_seq_len: int = 4 * 2048 # doubled to enable longer window sizes
-    val_batch_size: int = 64 * 2048
-    device_batch_size_tokens: int = 8 * 2048  # per-rank sequence length (varlen B==1)
+    train_bs_schedule: tuple = (32 * 2048,32 * 2048)
+    train_bs_extension: int = 32 * 2048
+    train_max_seq_len: int = 32 * 2048 # doubled to enable longer window sizes
+    val_batch_size: int = 32 * 2048
+    device_batch_size_tokens: int = 32 * 2048  # per-rank sequence length (varlen B==1)
     reference_batch_size: int = 2**19
     # optimization
     unembedding_lr: float = 0.004
@@ -2300,9 +2299,7 @@ class Hyperparameters:
     # attention masking
     block_size: int = 128
     window_pattern: str = "SSSL"
-    ws_schedule: tuple = (1, 2, 3, 4,
-                          5, 6, 7, 8,
-                          11, 16, 20, 24)
+    ws_schedule: tuple = (3, 7, 11, 15, 19, 23, 27)
     ws_final: int = 27 # set final validation ws, used for YaRN extension and short window size
     ws_validate_post_yarn_ext: int = 27 # extend long windows out even further after applying YaRN
     # model (GQA) - 0 means use num_heads (GQA disabled, nanochat default)
