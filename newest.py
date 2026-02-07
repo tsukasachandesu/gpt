@@ -2299,9 +2299,9 @@ class Hyperparameters:
     # attention masking
     block_size: int = 128
     window_pattern: str = "SSSL"
-    ws_schedule: tuple = (3, 7, 11, 15, 19, 23, 27)
-    ws_final: int = 27 # set final validation ws, used for YaRN extension and short window size
-    ws_validate_post_yarn_ext: int = 27 # extend long windows out even further after applying YaRN
+    ws_schedule: tuple = (5,5)
+    ws_final: int = 5 # set final validation ws, used for YaRN extension and short window size
+    ws_validate_post_yarn_ext: int = 5 # extend long windows out even further after applying YaRN
     # model (GQA) - 0 means use num_heads (GQA disabled, nanochat default)
     num_kv_heads: int = 0
 
